@@ -1,6 +1,6 @@
 // Standalone VeneraNext source. No browser/GM globals or external imports.
 class PhotoDeckGravureLabSource extends ComicSource {
-    version = "0.1.2"
+    version = "0.1.3"
     minAppVersion = "1.17.0"
     constructor(){super();this.directoryInstall()}
     // Bound native category widgets, not the stored directory or reading data.
@@ -49,6 +49,8 @@ class PhotoDeckGravureLabSource extends ComicSource {
     labels = []
     details = {}
     pending = {}
+    listPending = {}
+    labelsPending = null
     clean(v) { return String(v ?? "").replace(/\s+/g, " ").trim() }
     headers(image = false) { return { "User-Agent": "Mozilla/5.0", "Referer": this.site + "/", "Accept": image ? "image/*,*/*;q=0.8" : "*/*" } }
     async request(url, json = false) {
@@ -71,9 +73,8 @@ class PhotoDeckGravureLabSource extends ComicSource {
         try { return this.clean(doc.querySelector("div")?.text) } finally { doc.dispose() }
     }
     init() { const saved = this.loadData("labels"); this.labels = Array.isArray(saved) ? saved : [] }
-    saveLabels(labels) { this.labels = labels; this.saveData("labels", labels) }
+    saveLabels(labels) { this.labels = labels; this.directoryMemo = null; this.saveData("labels", labels) }
     tagTarget(label, id = label) { return { page: "category", attributes: { category: label, param: String(id) } } }
-    labelGroup(label) { const c = String(label).charAt(0).toUpperCase(); return /^[A-Z]$/.test(c) ? c : /^[0-9]$/.test(c) ? "0–9" : "中文／日文／其他" }
     groupedParts() {
         return [{name:"缓存标签（每批最多 60 项；源设置可搜索／翻批）",type:"dynamic",
             loader:()=>this.directoryWindow().map(x=>({label:x.name||x,target:this.tagTarget(x.name||x,x.id||x)}))}]
@@ -116,10 +117,31 @@ class PhotoDeckGravureLabSource extends ComicSource {
     site = "https://gravurelab.com"
     validId(id) { return /^[a-zA-Z0-9_-]+$/.test(String(id)) ? String(id) : null }
     galleryId(url) { return /^(?:https?:\/\/gravurelab\.com)?\/gallery\/([a-zA-Z0-9_-]+)(?:[?#]|$)/.exec(String(url))?.[1] || null }
+    listRoute(raw) {
+        let path = String(raw || "").replace(/&amp;/g,"&").split("#")[0]
+        if (/^https?:\/\//i.test(path)) {
+            if (!path.startsWith(this.site+"/")) return null
+            path = path.slice(this.site.length)
+        }
+        if (!path.startsWith("/")) return null
+        const [route,query=""] = path.split("?"), filters=[]
+        let page=1
+        try {
+            for (const pair of query.split("&").filter(Boolean)) {
+                const eq=pair.indexOf("="), key=decodeURIComponent(eq<0?pair:pair.slice(0,eq))
+                const value=decodeURIComponent((eq<0?"":pair.slice(eq+1)).replace(/\+/g," "))
+                if(key==="page") { if(!/^\d+$/.test(value))return null;page=Number(value) }
+                else filters.push(key+"="+encodeURIComponent(value))
+            }
+        } catch (_) { return null }
+        return {identity:route+"?"+filters.sort().join("&"),page}
+    }
     parseList(html, path, page) {
         const doc = new HtmlDocument(html), comics = [], seen = {}
         try {
-            for (const a of doc.querySelectorAll("a[href]")) {
+            const main=doc.querySelector("main")
+            if(!main)throw new Error(this.name+"：列表结构无法识别，请检查原站；不会当成没有结果。")
+            for (const a of main.querySelectorAll("a[href]")) {
                 const id = this.galleryId(a.attributes.href)
                 if (!id || seen[id]) continue
                 let card = a.parent
@@ -131,19 +153,27 @@ class PhotoDeckGravureLabSource extends ComicSource {
                 seen[id] = true
                 comics.push({id,title:this.clean(heading.text),cover,tags:card.querySelectorAll("a[href^='/tags/']").map(t=>this.clean(t.text))})
             }
-            // Only follow pagination for this exact route, excluding language links.
-            const route = path.split("?")[0]
-            const next = doc.querySelectorAll("a[href]").some(a => {
-                const href = String(a.attributes.href).replace(/&amp;/g,"&")
-                return href.split("?")[0] === route && Number(/[?&]page=(\d+)/.exec(href)?.[1]) === Number(page)+1
-            })
-            return {comics,maxPage:next ? Number(page)+1 : Number(page)}
+            const emptySearch=path.startsWith("/search?") && main.querySelector("form[action='/search']") &&
+                main.querySelectorAll("h3").some(h=>this.clean(h.text)==="No results")
+            if(!comics.length && !emptySearch)throw new Error(this.name+"：没有识别到有效列表；可能是维护页或页面结构变化。")
+            const route=this.listRoute(path), current=Math.max(1,Number(page)||1)
+            let next=false,last=0
+            for(const a of main.querySelectorAll("a[href]")) {
+                const target=this.listRoute(a.attributes.href)
+                if(!route || !target || target.identity!==route.identity)continue
+                if(target.page===current+1)next=true
+                if(/(?:^|\s)last(?:\s|$)/i.test(a.attributes.rel||"") || /^(?:Last|末页)$/i.test(this.clean(a.text)))last=Math.max(last,target.page)
+            }
+            return {comics,maxPage:Math.max(current,last,next?current+1:current)}
         } finally {doc.dispose()}
     }
     async loadList(page, tag="", word="", hot=false) {
         const n=Math.max(1,Number(page)||1)
         const path=tag ? "/tags/"+encodeURIComponent(tag) : word ? "/search?q="+encodeURIComponent(word) : hot ? "/hot" : "/"
-        return this.parseList(await this.request(this.site+path+(path.includes("?")?"&":"?")+"page="+n),path,n)
+        const url=this.site+path+(path.includes("?")?"&":"?")+"page="+n
+        if(this.listPending[url])return await this.listPending[url]
+        this.listPending[url]=(async()=>this.parseList(await this.request(url),path,n))()
+        try{return await this.listPending[url]}finally{delete this.listPending[url]}
     }
     parseDetail(html,id) {
         const doc=new HtmlDocument(html)
@@ -176,16 +206,27 @@ class PhotoDeckGravureLabSource extends ComicSource {
     }
     async fetchDetail(id){return this.parseDetail(await this.request(this.site+"/gallery/"+id),id)}
     async refreshLabels(){
+        if(this.labelsPending)return await this.labelsPending
+        this.labelsPending=this.fetchLabels()
+        try{return await this.labelsPending}finally{this.labelsPending=null}
+    }
+    async fetchLabels(){
         const labels=[],seen={};let page=1
         while(true){
             const doc=new HtmlDocument(await this.request(this.site+"/tags?page="+page))
             let next=false
             try{
-                for(const a of doc.querySelectorAll("a[href^='/tags/']")){
+                const main=doc.querySelector("main"),before=labels.length
+                if(!main||this.clean(main.querySelector("h1")?.text)!=="Tags")throw new Error(this.name+"：标签目录结构异常，旧缓存未修改。")
+                for(const a of main.querySelectorAll("a[href^='/tags/']")){
                     let tag;try{tag=decodeURIComponent(a.attributes.href.slice(6).split(/[?#]/)[0])}catch(_){continue}
                     if(tag&&!seen[tag]){seen[tag]=true;labels.push(tag)}
                 }
-                next=doc.querySelectorAll("a[href]").some(a=>a.attributes.href==="/tags?page="+(page+1))
+                if(labels.length===before)throw new Error(this.name+"：标签分页为空或重复，旧缓存未修改。")
+                next=main.querySelectorAll("a[href]").some(a=>{
+                    const target=this.listRoute(a.attributes.href)
+                    return target?.identity==="/tags?"&&target.page===page+1
+                })
             }finally{doc.dispose()}
             if(!next)break
             if(++page>500)throw new Error(this.name+"：标签分页异常，已停止，旧缓存未修改。")
