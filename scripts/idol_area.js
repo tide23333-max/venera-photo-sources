@@ -1,11 +1,56 @@
 // Standalone VeneraNext source. No browser/GM globals or external imports.
 class PhotoDeckIdolAreaSource extends ComicSource {
-    version = "0.1.1"
+    version = "0.1.3"
     minAppVersion = "1.17.0"
+    constructor(){super();this.directoryInstall()}
+    // Bound native category widgets, not the stored directory or reading data.
+    directoryMemo = null
+    directoryRawEntries() { return Array.isArray(this.catalog) ? this.catalog : (Array.isArray(this.labels) ? this.labels : []) }
+    directoryLabel(entry) { return String(typeof entry === "string" ? entry : (entry?.name || entry?.label || "")) }
+    directoryPageData() {
+        const entries = this.directoryRawEntries(), state = this.loadData("directory_view_v1") || {}
+        const query = String(state.query || "").trim().toLowerCase(), requested = Math.max(1, Math.floor(Number(state.page) || 1))
+        const memo = this.directoryMemo
+        if (memo && memo.entries === entries && memo.length === entries.length && memo.query === query && memo.requested === requested) return memo.result
+        const filtered = entries.filter(e => this.directoryLabel(e).toLowerCase().includes(query))
+            .sort((a,b) => {
+                const x=this.directoryLabel(a).toUpperCase(), y=this.directoryLabel(b).toUpperCase()
+                return x<y?-1:x>y?1:0
+            })
+        const pages = Math.max(1, Math.ceil(filtered.length / 30)), page = Math.min(requested,pages)
+        const result = {items:filtered.slice((page-1)*30,page*30),page,pages,total:entries.length,matched:filtered.length,query}
+        this.directoryMemo = {entries,length:entries.length,query,requested,result}
+        return result
+    }
+    directoryWindow() { return this.directoryPageData().items }
+    directoryNotice() {
+        const d=this.directoryPageData()
+        UI.showMessage("缓存 "+d.total+" 项，匹配 "+d.matched+" 项；第 "+d.page+"/"+d.pages+" 批，每批最多 30 项。修改后请重新进入分类页；完整缓存没有删除。")
+    }
+    directoryInstall() {
+        this.settings={...(this.settings||{}),
+            directorySearch:{title:"搜索缓存标签（不联网）",type:"callback",buttonText:"搜索／清空筛选",callback:async()=>{
+                const text=await UI.showInputDialog("输入标签关键词；留空恢复全部缓存")
+                if(text===null||text===undefined)return
+                this.saveData("directory_view_v1",{query:String(text).trim(),page:1});this.directoryNotice()
+            }},
+            directoryPrevious:{title:"缓存目录：上一批",type:"callback",buttonText:"上一批",callback:()=>{
+                const d=this.directoryPageData()
+                this.saveData("directory_view_v1",{query:d.query,page:Math.max(1,d.page-1)});this.directoryNotice()
+            }},
+            directoryNext:{title:"缓存目录：下一批",type:"callback",buttonText:"下一批",callback:()=>{
+                const d=this.directoryPageData()
+                this.saveData("directory_view_v1",{query:d.query,page:Math.min(d.pages,d.page+1)});this.directoryNotice()
+            }},
+            directoryDisplayStatus:{title:"缓存目录显示状态",type:"callback",buttonText:"查看批次",callback:()=>this.directoryNotice()}
+        }
+    }
     url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/idol_area.js"
     labels = []
     details = {}
     pending = {}
+    listPending = {}
+    labelsPending = null
     clean(v) { return String(v ?? "").replace(/\s+/g, " ").trim() }
     headers(image = false) { return { "User-Agent": "Mozilla/5.0", "Referer": this.site + "/", "Accept": image ? "image/*,*/*;q=0.8" : "*/*" } }
     async request(url, json = false) {
@@ -28,14 +73,16 @@ class PhotoDeckIdolAreaSource extends ComicSource {
         try { return this.clean(doc.querySelector("div")?.text) } finally { doc.dispose() }
     }
     init() { const saved = this.loadData("labels"); this.labels = Array.isArray(saved) ? saved : [] }
-    saveLabels(labels) { this.labels = labels; this.saveData("labels", labels) }
+    saveLabels(labels) {
+        const values=[...new Set(labels.filter(v=>typeof v==="string"&&v.trim()).map(v=>v.trim()))].sort()
+        if(!values.length)return false
+        if(this.labels.length===values.length&&this.labels.every((v,i)=>v===values[i]))return true
+        this.labels=values;this.directoryMemo=null;this.saveData("labels",values);return true
+    }
     tagTarget(label, id = label) { return { page: "category", attributes: { category: label, param: String(id) } } }
-    labelGroup(label) { const c = String(label).charAt(0).toUpperCase(); return /^[A-Z]$/.test(c) ? c : /^[0-9]$/.test(c) ? "0–9" : "中文／日文／其他" }
     groupedParts() {
-        return [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0–9", "中文／日文／其他"].map(group => ({
-            name: "全部标签 · " + group, type: "dynamic",
-            loader: () => this.labels.filter(x => this.labelGroup(x.name || x) === group).map(x => ({ label: x.name || x, target: this.tagTarget(x.name || x, x.id || x) }))
-        }))
+        return [{name:"缓存标签（每批最多 30 项；源设置可搜索／翻批）",type:"dynamic",
+            loader:()=>this.directoryWindow().map(x=>({label:x.name||x,target:this.tagTarget(x.name||x,x.id||x)}))}]
     }
     async getDetail(id) {
         id = this.validId(id)
@@ -56,9 +103,8 @@ class PhotoDeckIdolAreaSource extends ComicSource {
         loadEp: async (id, epId) => ({ images: (await this.getDetail(id)).images }),
         onThumbnailLoad: url => ({ url, headers: this.headers(true) }),
         onImageLoad: (url, id, epId) => this.imageConfig(url, id),
-        onClickTag: (namespace, label) => this.tagTarget(label, this.labels.find(x => x.name === label)?.id || label)
+        onClickTag: (namespace, label) => this.tagTarget(label)
     }
-    imageConfig(url) { return { url, headers: this.headers(true) } }
     settings = {
         refreshLabels: {
             title: "刷新全部标签（首次使用请点击）", type: "callback", buttonText: "刷新标签",
@@ -77,7 +123,7 @@ class PhotoDeckIdolAreaSource extends ComicSource {
     sized(url, size) {
         return /^https?:\/\/(?:blogger\.googleusercontent\.com|[1-4]\.bp\.blogspot\.com)\//i.test(url) ? url.replace(/\/(?:s|w|h)\d+(?:-[a-zA-Z0-9]+)*\//, "/s" + size + "/") : url
     }
-    parseImages(html) {
+    parseImages(html, firstOnly = false) {
         const doc = new HtmlDocument(html); const images = [], seen = {}
         try {
             for (const img of doc.querySelectorAll("img")) {
@@ -91,17 +137,19 @@ class PhotoDeckIdolAreaSource extends ComicSource {
                 let u = usable(link) ? link : this.imageUrl(a["data-src"] || a.src)
                 if (!u || !usable(u)) continue
                 const identity = this.sized(u, 0)
-                if (!seen[identity]) { seen[identity] = true; images.push(u) }
+                if (!seen[identity]) { seen[identity] = true; images.push(u); if(firstOnly)break }
             }
         } finally { doc.dispose() }
         return images
     }
-    meta(entry) {
+    meta(entry, includeImages = true) {
+        if(!entry||typeof entry!=="object")return null
         const id = /\.post-(\d+)$/.exec(String(entry.id?.$t ?? ""))?.[1]
         if (!id) return null
         const html = entry.content?.$t || ""
-        const images = this.parseImages(html)
-        const cover = this.imageUrl(entry["media$thumbnail"]?.url) || images[0] || ""
+        const images = includeImages ? this.parseImages(html) : []
+        const thumbnail=this.imageUrl(entry["media$thumbnail"]?.url)
+        const cover = thumbnail || (includeImages?images[0]:this.parseImages(html,true)[0]) || ""
         return { id, title: this.clean(entry.title?.$t), cover: this.sized(cover, 480),
             tags: (entry.category || []).map(x => x.term).filter(Boolean),
             subtitle: String(entry.published?.$t || "").slice(0,10), description: this.plain(entry.summary?.$t || html).slice(0,1500),
@@ -110,26 +158,43 @@ class PhotoDeckIdolAreaSource extends ComicSource {
     }
     feedUrl(page, tag = "", word = "", count = 20) {
         return this.site + "/feeds/posts/default" + (tag ? "/-/" + encodeURIComponent(tag) : "") +
-            "?alt=json&orderby=published&max-results=" + count + "&start-index=" + ((Math.max(1, Number(page) || 1)-1)*count+1) + (word ? "&q=" + encodeURIComponent(word) : "")
+            "?alt=json&orderby=published&max-results=" + count + "&start-index=" + ((Math.max(1, Math.floor(Number(page) || 1))-1)*count+1) + (word ? "&q=" + encodeURIComponent(word) : "")
+    }
+    validateFeed(feed) {
+        const total=feed?.["openSearch$totalResults"]?.$t
+        if(!feed||typeof feed!=="object"||Array.isArray(feed)||
+            (feed.entry!=null&&!Array.isArray(feed.entry))||
+            (feed.category!=null&&!Array.isArray(feed.category))||
+            (feed.entry==null&&total==null)||
+            (total!=null&&(!/^\d+$/.test(String(total))||!Number.isSafeInteger(Number(total)))))
+            throw new Error(this.name+"：文章列表或分页字段异常；不会当成没有结果。")
     }
     async loadList(page, tag = "", word = "") {
+        const url=this.feedUrl(page,tag,word)
+        if(this.listPending[url])return await this.listPending[url]
+        this.listPending[url]=this.fetchList(page,tag,word)
+        try{return await this.listPending[url]}finally{delete this.listPending[url]}
+    }
+    async fetchList(page, tag = "", word = "") {
         const data = await this.request(this.feedUrl(page, tag, word), true)
-        if (!data.feed) throw new Error(this.name + "：文章列表结构已改变。")
-        if (!tag && !word && data.feed.category) this.saveLabels(data.feed.category.map(x => x.term).filter(Boolean).sort())
+        this.validateFeed(data?.feed)
         const entries = data.feed.entry || []
         const seen = {}; const comics = []
         for (const entry of entries) {
-            const m = this.meta(entry)
+            const m = this.meta(entry,false)
             if (!m || seen[m.id]) continue
             seen[m.id] = true
             comics.push({ id: m.id, title: m.title, cover: m.cover, tags: m.tags, subtitle: m.subtitle, description: m.description })
         }
-        const n = Math.max(1, Number(page) || 1), total = Number(data.feed["openSearch$totalResults"]?.$t) || 0
-        return { comics, maxPage: word ? (entries.length === 20 ? n+1 : n) : Math.max(n, Math.ceil(total/20)) }
+        if(entries.length&&!comics.length)throw new Error(this.name+"：返回文章无法识别，可能是接口结构变化。")
+        if(!tag&&!word&&data.feed.category)this.saveLabels(data.feed.category.map(x=>x?.term))
+        const n = Math.max(1, Math.floor(Number(page) || 1)), rawTotal=data.feed["openSearch$totalResults"]?.$t
+        const total=rawTotal==null?null:Number(rawTotal)
+        return { comics, maxPage: word || total===null ? (entries.length === 20 ? n+1 : n) : Math.max(1, Math.ceil(total/20)) }
     }
     async fetchDetail(id) {
         const data = await this.request(this.site + "/feeds/posts/default/" + id + "?alt=json", true)
-        const m = data.entry && this.meta(data.entry)
+        const m = data?.entry && this.meta(data.entry)
         if (!m || m.id !== id) throw new Error(this.name + "：文章接口结构异常。")
         if (!data.entry.content?.$t && m.original) {
             const doc = new HtmlDocument(await this.request(m.original))
@@ -148,9 +213,13 @@ class PhotoDeckIdolAreaSource extends ComicSource {
         return config
     }
     async refreshLabels() {
-        const data = await this.request(this.feedUrl(1,"","",1),true)
-        if (!Array.isArray(data.feed?.category)) throw new Error(this.name + "：没有取得标签目录。")
-        this.saveLabels(data.feed.category.map(x=>x.term).filter(Boolean).sort())
+        if(this.labelsPending)return await this.labelsPending
+        this.labelsPending=(async()=>{
+            const data = await this.request(this.feedUrl(1,"","",1),true)
+            this.validateFeed(data?.feed)
+            if (!Array.isArray(data.feed.category)||!this.saveLabels(data.feed.category.map(x=>x?.term))) throw new Error(this.name + "：没有取得有效标签目录，旧缓存已保留。")
+        })()
+        try{return await this.labelsPending}finally{this.labelsPending=null}
     }
     explore = [{ title: "IDOL AREA 最新", type: "multiPageComicList", load: async page => this.loadList(page) }]
     search = { optionList: [], load: async (word, options, page) => this.loadList(page,"",this.clean(word)) }
@@ -162,5 +231,4 @@ class PhotoDeckIdolAreaSource extends ComicSource {
         ].map(([label,id])=>({label,target:this.tagTarget(id)})) }, ...this.groupedParts()]
     }
 }
-
 

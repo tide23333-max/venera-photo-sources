@@ -3,14 +3,59 @@
 class PhotoDeckAitodaSource extends ComicSource {
     name = "Aitoda · Nao Kanzaki"
     key = "photo_deck_aitoda"
-    version = "0.1.1"
+    version = "0.1.3"
     minAppVersion = "1.17.0"
-    url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/aitoda.js" // Reserved for a future raw script download URL, not the blog URL.
+    constructor(){super();this.directoryInstall()}
+    // Bound native category widgets, not the stored directory or reading data.
+    directoryMemo = null
+    directoryRawEntries() { return Array.isArray(this.catalog) ? this.catalog : (Array.isArray(this.labels) ? this.labels : []) }
+    directoryLabel(entry) { return String(typeof entry === "string" ? entry : (entry?.name || entry?.label || "")) }
+    directoryPageData() {
+        const entries = this.directoryRawEntries(), state = this.loadData("directory_view_v1") || {}
+        const query = String(state.query || "").trim().toLowerCase(), requested = Math.max(1, Math.floor(Number(state.page) || 1))
+        const memo = this.directoryMemo
+        if (memo && memo.entries === entries && memo.length === entries.length && memo.query === query && memo.requested === requested) return memo.result
+        const filtered = entries.filter(e => this.directoryLabel(e).toLowerCase().includes(query))
+            .sort((a,b) => {
+                const x=this.directoryLabel(a).toUpperCase(), y=this.directoryLabel(b).toUpperCase()
+                return x<y?-1:x>y?1:0
+            })
+        const pages = Math.max(1, Math.ceil(filtered.length / 30)), page = Math.min(requested,pages)
+        const result = {items:filtered.slice((page-1)*30,page*30),page,pages,total:entries.length,matched:filtered.length,query}
+        this.directoryMemo = {entries,length:entries.length,query,requested,result}
+        return result
+    }
+    directoryWindow() { return this.directoryPageData().items }
+    directoryNotice() {
+        const d=this.directoryPageData()
+        UI.showMessage("缓存 "+d.total+" 项，匹配 "+d.matched+" 项；第 "+d.page+"/"+d.pages+" 批，每批最多 30 项。修改后请重新进入分类页；完整缓存没有删除。")
+    }
+    directoryInstall() {
+        this.settings={...(this.settings||{}),
+            directorySearch:{title:"搜索缓存标签（不联网）",type:"callback",buttonText:"搜索／清空筛选",callback:async()=>{
+                const text=await UI.showInputDialog("输入标签关键词；留空恢复全部缓存")
+                if(text===null||text===undefined)return
+                this.saveData("directory_view_v1",{query:String(text).trim(),page:1});this.directoryNotice()
+            }},
+            directoryPrevious:{title:"缓存目录：上一批",type:"callback",buttonText:"上一批",callback:()=>{
+                const d=this.directoryPageData()
+                this.saveData("directory_view_v1",{query:d.query,page:Math.max(1,d.page-1)});this.directoryNotice()
+            }},
+            directoryNext:{title:"缓存目录：下一批",type:"callback",buttonText:"下一批",callback:()=>{
+                const d=this.directoryPageData()
+                this.saveData("directory_view_v1",{query:d.query,page:Math.min(d.pages,d.page+1)});this.directoryNotice()
+            }},
+            directoryDisplayStatus:{title:"缓存目录显示状态",type:"callback",buttonText:"查看批次",callback:()=>this.directoryNotice()}
+        }
+    }
+    url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/aitoda.js"
     site = "https://aitoda.blogspot.com"
     pageSize = 20
     metadata = {}
     details = {}
     pendingDetails = {}
+    listPending = {}
+    labelsPending = null
     labels = []
     userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
@@ -171,19 +216,22 @@ class PhotoDeckAitodaSource extends ComicSource {
     }
 
     rememberLabels(categories) {
-        if (!Array.isArray(categories) || !categories.length) return
-        const seen = {}
+        if (!Array.isArray(categories) || !categories.length) return false
+        const seen = Object.create(null)
         const labels = []
         for (const category of categories) {
-            const label = String(category.term ?? "").trim()
+            const label = String(category?.term ?? "").trim()
             if (!label || seen[label]) continue
             seen[label] = true
             labels.push(label)
         }
-        if (!labels.length) return
+        if (!labels.length) return false
         labels.sort((a, b) => a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0)
+        if(this.labels.length===labels.length && this.labels.every((v,i)=>v===labels[i]))return true
         this.labels = labels
+        this.directoryMemo = null
         this.saveData("labels", labels)
+        return true
     }
 
     feedUrl(page = 1, label = "", query = "", count = this.pageSize) {
@@ -198,12 +246,32 @@ class PhotoDeckAitodaSource extends ComicSource {
         let data
         try { data = JSON.parse(body) }
         catch (_) { throw new Error("Aitoda：文章接口未返回 JSON，请检查网络或原站。") }
-        if (!data.feed || typeof data.feed !== "object") throw new Error("Aitoda：文章接口结构已改变。")
+        this.validateFeed(data?.feed)
         if (rememberLabels) this.rememberLabels(data.feed.category)
         return data.feed
     }
 
+    validateFeed(feed) {
+        const total=feed?.["openSearch$totalResults"]?.$t
+        if(!feed || typeof feed!=="object" || Array.isArray(feed) ||
+            (feed.entry!=null&&!Array.isArray(feed.entry)) ||
+            (feed.category!=null&&!Array.isArray(feed.category)) ||
+            (feed.entry==null&&total==null) ||
+            (total!=null&&(!/^\d+$/.test(String(total))||!Number.isSafeInteger(Number(total)))))
+            throw new Error("Aitoda：文章列表或分页字段异常；不会当成没有结果。")
+    }
+
+    async refreshLabels() {
+        if(this.labelsPending)return await this.labelsPending
+        this.labelsPending=(async()=>{
+            const feed=await this.readFeed(this.feedUrl(1,"","",1))
+            if(!this.rememberLabels(feed.category))throw new Error("Aitoda：没有取得有效标签目录，旧缓存已保留。")
+        })()
+        try{return await this.labelsPending}finally{this.labelsPending=null}
+    }
+
     parseEntry(entry) {
+        if(!entry || typeof entry!=="object")return null
         const alternate = (entry.link || []).find(link => link.rel === "alternate" && link.type === "text/html")
         const id = this.canonicalId(alternate?.href)
         if (!id) return null
@@ -225,8 +293,15 @@ class PhotoDeckAitodaSource extends ComicSource {
     }
 
     async loadList(page, label = "", query = "") {
+        const url=this.feedUrl(page,label,query)
+        if(this.listPending[url])return await this.listPending[url]
+        this.listPending[url]=this.fetchList(page,label,query)
+        try{return await this.listPending[url]}finally{delete this.listPending[url]}
+    }
+
+    async fetchList(page, label = "", query = "") {
         const n = Math.max(1, Math.floor(Number(page) || 1))
-        const feed = await this.readFeed(this.feedUrl(n, label, query), !label && !query)
+        const feed = await this.readFeed(this.feedUrl(n, label, query))
         const entries = Array.isArray(feed.entry) ? feed.entry : []
         const seen = {}
         const comics = []
@@ -236,11 +311,14 @@ class PhotoDeckAitodaSource extends ComicSource {
             seen[comic.id] = true
             comics.push(comic)
         }
+        if(entries.length&&!comics.length)throw new Error("Aitoda：返回文章无法识别，可能是接口结构变化。")
+        if(!label&&!query)this.rememberLabels(feed.category)
         const keys = Object.keys(this.metadata)
         for (let i = 0; i < keys.length - 240; i++) delete this.metadata[keys[i]]
-        const total = Math.max(0, Number(feed["openSearch$totalResults"]?.$t) || 0)
+        const rawTotal=feed["openSearch$totalResults"]?.$t
+        const total = rawTotal==null?null:Number(rawTotal)
         // Blogger's q search reports current-page counts, not a global total.
-        const maxPage = query ? (entries.length === this.pageSize ? n + 1 : n) : Math.max(n, Math.ceil(total / this.pageSize))
+        const maxPage = query || total===null ? (entries.length === this.pageSize ? n + 1 : n) : Math.max(1, Math.ceil(total / this.pageSize))
         return { comics, maxPage }
     }
 
@@ -253,12 +331,6 @@ class PhotoDeckAitodaSource extends ComicSource {
     search = {
         optionList: [],
         load: async (keyword, options, page) => this.loadList(page, "", this.cleanText(keyword))
-    }
-
-    labelGroup(label) {
-        const initial = String(label).charAt(0).toUpperCase()
-        if (/^[A-Z]$/.test(initial)) return initial
-        return /^[0-9]$/.test(initial) ? "0–9" : "中文／日文／其他"
     }
 
     category = {
@@ -277,12 +349,12 @@ class PhotoDeckAitodaSource extends ComicSource {
                 ["日向坂46", "Hinatazaka46"],
                 ["樱坂46", "Sakurazaka46"]
             ].map(([label, tag]) => ({ label, target: this.tagTarget(tag) }))
-        }, ...[..."ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0–9", "中文／日文／其他"].map(group => ({
-            name: "全部标签 · " + group,
+        }, {
+            name: "缓存标签（每批最多 30 项；源设置可搜索／翻批）",
             type: "dynamic",
-            loader: () => this.labels.filter(label => this.labelGroup(label) === group)
+            loader: () => this.directoryWindow()
                 .map(label => ({ label, target: this.tagTarget(label) }))
-        }))]
+        }]
     }
 
     categoryComics = {
@@ -296,7 +368,7 @@ class PhotoDeckAitodaSource extends ComicSource {
             type: "callback",
             buttonText: "刷新标签",
             callback: async () => {
-                await this.readFeed(this.feedUrl(1, "", "", 1), true)
+                await this.refreshLabels()
                 UI.showMessage("已保存 " + this.labels.length + " 个标签。请重新打开分类页。")
             }
         },
@@ -308,4 +380,3 @@ class PhotoDeckAitodaSource extends ComicSource {
         }
     }
 }
-

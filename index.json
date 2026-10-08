@@ -44,7 +44,7 @@
   {
     "name": "Aitoda · Nao Kanzaki",
     "key": "photo_deck_aitoda",
-    "version": "0.1.1",
+    "version": "0.1.3",
     "fileName": "scripts/aitoda.js",
     "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
   },
@@ -58,7 +58,7 @@
   {
     "name": "IDOL AREA",
     "key": "photo_deck_idol_area",
-    "version": "0.1.1",
+    "version": "0.1.3",
     "fileName": "scripts/idol_area.js",
     "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
   },
