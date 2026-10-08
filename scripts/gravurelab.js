@@ -1,7 +1,50 @@
 // Standalone VeneraNext source. No browser/GM globals or external imports.
 class PhotoDeckGravureLabSource extends ComicSource {
-    version = "0.1.1"
+    version = "0.1.2"
     minAppVersion = "1.17.0"
+    constructor(){super();this.directoryInstall()}
+    // Bound native category widgets, not the stored directory or reading data.
+    directoryMemo = null
+    directoryRawEntries() { return Array.isArray(this.catalog) ? this.catalog : (Array.isArray(this.labels) ? this.labels : []) }
+    directoryLabel(entry) { return String(typeof entry === "string" ? entry : (entry?.name || entry?.label || "")) }
+    directoryPageData() {
+        const entries = this.directoryRawEntries(), state = this.loadData("directory_view_v1") || {}
+        const query = String(state.query || "").trim().toLowerCase(), requested = Math.max(1, Math.floor(Number(state.page) || 1))
+        const memo = this.directoryMemo
+        if (memo && memo.entries === entries && memo.length === entries.length && memo.query === query && memo.requested === requested) return memo.result
+        const filtered = entries.filter(e => this.directoryLabel(e).toLowerCase().includes(query))
+            .sort((a,b) => {
+                const x=this.directoryLabel(a).toUpperCase(), y=this.directoryLabel(b).toUpperCase()
+                return x<y?-1:x>y?1:0
+            })
+        const pages = Math.max(1, Math.ceil(filtered.length / 60)), page = Math.min(requested,pages)
+        const result = {items:filtered.slice((page-1)*60,page*60),page,pages,total:entries.length,matched:filtered.length,query}
+        this.directoryMemo = {entries,length:entries.length,query,requested,result}
+        return result
+    }
+    directoryWindow() { return this.directoryPageData().items }
+    directoryNotice() {
+        const d=this.directoryPageData()
+        UI.showMessage("缓存 "+d.total+" 项，匹配 "+d.matched+" 项；第 "+d.page+"/"+d.pages+" 批，每批最多 60 项。修改后请重新进入分类页；完整缓存没有删除。")
+    }
+    directoryInstall() {
+        this.settings={...(this.settings||{}),
+            directorySearch:{title:"搜索缓存标签（不联网）",type:"callback",buttonText:"搜索／清空筛选",callback:async()=>{
+                const text=await UI.showInputDialog("输入标签关键词；留空恢复全部缓存")
+                if(text===null||text===undefined)return
+                this.saveData("directory_view_v1",{query:String(text).trim(),page:1});this.directoryNotice()
+            }},
+            directoryPrevious:{title:"缓存目录：上一批",type:"callback",buttonText:"上一批",callback:()=>{
+                const d=this.directoryPageData()
+                this.saveData("directory_view_v1",{query:d.query,page:Math.max(1,d.page-1)});this.directoryNotice()
+            }},
+            directoryNext:{title:"缓存目录：下一批",type:"callback",buttonText:"下一批",callback:()=>{
+                const d=this.directoryPageData()
+                this.saveData("directory_view_v1",{query:d.query,page:Math.min(d.pages,d.page+1)});this.directoryNotice()
+            }},
+            directoryDisplayStatus:{title:"缓存目录显示状态",type:"callback",buttonText:"查看批次",callback:()=>this.directoryNotice()}
+        }
+    }
     url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/gravurelab.js"
     labels = []
     details = {}
@@ -32,10 +75,8 @@ class PhotoDeckGravureLabSource extends ComicSource {
     tagTarget(label, id = label) { return { page: "category", attributes: { category: label, param: String(id) } } }
     labelGroup(label) { const c = String(label).charAt(0).toUpperCase(); return /^[A-Z]$/.test(c) ? c : /^[0-9]$/.test(c) ? "0–9" : "中文／日文／其他" }
     groupedParts() {
-        return [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0–9", "中文／日文／其他"].map(group => ({
-            name: "全部标签 · " + group, type: "dynamic",
-            loader: () => this.labels.filter(x => this.labelGroup(x.name || x) === group).map(x => ({ label: x.name || x, target: this.tagTarget(x.name || x, x.id || x) }))
-        }))
+        return [{name:"缓存标签（每批最多 60 项；源设置可搜索／翻批）",type:"dynamic",
+            loader:()=>this.directoryWindow().map(x=>({label:x.name||x,target:this.tagTarget(x.name||x,x.id||x)}))}]
     }
     async getDetail(id) {
         id = this.validId(id)
@@ -163,5 +204,4 @@ class PhotoDeckGravureLabSource extends ComicSource {
         {name:"地区",type:"fixed",categories:[["日本","japanese"],["中国","chinese"],["韩国","korean"]].map(([label,id])=>({label,target:this.tagTarget(id)}))},...this.groupedParts()
     ]}
 }
-
 
