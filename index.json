@@ -1,0 +1,72 @@
+[
+  {
+    "name": "SZZS / 4KHD",
+    "key": "photo_deck_4khd",
+    "version": "0.1.7",
+    "fileName": "scripts/4khd.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "GirlStop",
+    "key": "photo_deck_girlstop",
+    "version": "0.1.3",
+    "fileName": "scripts/girlstop.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "Geinou Nude",
+    "key": "photo_deck_geinou_nude",
+    "version": "0.1.4",
+    "fileName": "scripts/geinou_nude.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "DANRYOKU",
+    "key": "photo_deck_danryoku",
+    "version": "0.1.6",
+    "fileName": "scripts/DANRYOKU.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "Everia Club",
+    "key": "photo_deck_everia_club",
+    "version": "0.2.3",
+    "fileName": "scripts/everia_club.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "V2PH",
+    "key": "photo_deck_v2ph",
+    "version": "0.3.29",
+    "fileName": "scripts/v2ph.js",
+    "description": "现用阅读实现；仅发布地址迁移，登录环境回归待确认"
+  },
+  {
+    "name": "Aitoda · Nao Kanzaki",
+    "key": "photo_deck_aitoda",
+    "version": "0.1.1",
+    "fileName": "scripts/aitoda.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "GravureLab",
+    "key": "photo_deck_gravurelab",
+    "version": "0.1.1",
+    "fileName": "scripts/gravurelab.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "IDOL AREA",
+    "key": "photo_deck_idol_area",
+    "version": "0.1.1",
+    "fileName": "scripts/idol_area.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  },
+  {
+    "name": "Gravia",
+    "key": "photo_deck_gravia",
+    "version": "0.1.1",
+    "fileName": "scripts/gravia.js",
+    "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
+  }
+]
