@@ -34,7 +34,7 @@ export function catalog(directory=path.join(root,'scripts')){
  const entries=definitions.map(([file,key])=>{
   const text=fs.readFileSync(path.join(directory,file),'utf8'),m=metadata(text,file);
   if(m.key!==key)fail(file+': source identity changed');
-  return {name:m.name,key,version:m.version,fileName:'scripts/'+file,description:file==='v2ph.js'?'现用阅读实现；仅发布地址迁移，登录环境回归待确认':'个人写真源；解析测试与客户端实测状态详见仓库文档'};
+  return {name:m.name,key,version:m.version,fileName:'scripts/'+file,description:file==='v2ph.js'?'保留现用阅读实现；新增目录缓存与手动刷新，登录环境实测待确认':'个人写真源；解析测试与客户端实测状态详见仓库文档'};
  });
  if(new Set(entries.map(x=>x.key)).size!==definitions.length)fail('Duplicate source key');return entries;
 }

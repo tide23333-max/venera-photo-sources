@@ -30,16 +30,16 @@
   {
     "name": "Everia Club",
     "key": "photo_deck_everia_club",
-    "version": "0.2.3",
+    "version": "0.2.4",
     "fileName": "scripts/everia_club.js",
     "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
   },
   {
     "name": "V2PH",
     "key": "photo_deck_v2ph",
-    "version": "0.3.29",
+    "version": "0.3.30",
     "fileName": "scripts/v2ph.js",
-    "description": "现用阅读实现；仅发布地址迁移，登录环境回归待确认"
+    "description": "保留现用阅读实现；新增目录缓存与手动刷新，登录环境实测待确认"
   },
   {
     "name": "Aitoda · Nao Kanzaki",

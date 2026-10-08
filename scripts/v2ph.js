@@ -3,7 +3,7 @@ class PhotoDeckV2phSource extends ComicSource {
 
     key = "photo_deck_v2ph"
 
-    version = "0.3.29"
+    version = "0.3.30"
 
     minAppVersion = "1.17.0"
 
@@ -2072,6 +2072,166 @@ class PhotoDeckV2phSource extends ComicSource {
         }
     }
 
+    // Directory-only extension. The reader and account callbacks are not replaced.
+    catalog = []
+    catalogBusy = false
+
+    catalogPath(raw) {
+        let value = String(raw ?? "").trim().replace(/&amp;/g, "&")
+        if (!value || /^(?:javascript|data|file):/i.test(value) || value.startsWith("#")) return ""
+        const absolute = /^(?:https?:)?\/\/([^/]+)(\/.*)?$/i.exec(value)
+        if (absolute) {
+            if (!/^(?:www\.)?v2ph\.(?:com|net|ru|ovh)$/i.test(absolute[1])) return ""
+            value = absolute[2] || "/"
+        }
+        if (!value.startsWith("/")) value = "/" + value
+        value = value.split("#")[0]
+        // Only public entity routes, not login links, album URLs or tracking tokens.
+        if (!/^\/(?:actor|model|company|vendor|category|tag|country)\/[^/?#]+/i.test(value)) return ""
+        const i = value.indexOf("?")
+        if (i >= 0) {
+            const query = value.slice(i + 1).split("&").filter(p => /^hl=/.test(p)).join("&")
+            value = value.slice(0, i) + (query ? "?" + query : "")
+        }
+        return value.replace(/%[a-f0-9]{2}/gi, v => v.toUpperCase())
+    }
+
+    catalogKind(path) {
+        if (/^\/(actor|model)\//i.test(path)) return "Model"
+        if (/^\/(company|vendor)\//i.test(path)) return "Vendor"
+        if (/^\/country\//i.test(path)) return "Country"
+        if (/^\/(category|tag)\//i.test(path)) return "Tags"
+        return ""
+    }
+
+    catalogExcluded(node, navigation = false) {
+        for (let p = node, n = 0; p && n < 20; p = p.parent, n++) {
+            if (p.localName === "body" || p.localName === "html") break
+            const mark = String(p.attributes?.class ?? "") + " " + String(p.attributes?.id ?? "")
+            if (p.localName === "aside" || p.localName === "footer" || /related|recommend|sidebar|widget|advert|footer/i.test(mark)) return true
+            if (!navigation && (p.localName === "nav" || /(?:^|\s)(?:menu|navigation)(?:\s|$)/i.test(mark))) return true
+        }
+        return false
+    }
+
+    catalogAdd(entries, ns, name, raw) {
+        const path = this.catalogPath(raw), label = this.cleanText(String(name ?? ""))
+        if (!path || !label || this.catalogKind(path) !== ns) return false
+        if (entries.some(e => e.ns === ns && e.path === path)) return false
+        entries.push({ ns, name: label, path })
+        return true
+    }
+
+    catalogCollect(root, entries = this.catalog, navigation = false) {
+        let changed = false
+        for (const a of root?.querySelectorAll?.("a[href]") ?? []) {
+            if (this.catalogExcluded(a, navigation)) continue
+            const path = this.catalogPath(a.attributes.href)
+            const name = this.displayNameFromLink(a)
+            if (/^(?:next|previous|more|下一页|上一页|更多)$/i.test(name)) continue
+            if (this.catalogAdd(entries, this.catalogKind(path), name, path)) changed = true
+        }
+        if (changed && entries === this.catalog) this.saveData("taxonomy_v2", this.catalog)
+        return changed
+    }
+
+    catalogItems(ns) {
+        const entries = this.catalog.filter(e => e.ns === ns)
+        return [...entries].sort((a, b) => {
+            const x = a.name.toUpperCase(), y = b.name.toUpperCase()
+            return x < y ? -1 : x > y ? 1 : a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+        }).map(e => {
+            const clash = entries.some(other => other !== e && other.name === e.name)
+            const suffix = e.path.split("?")[0].replace(/\/$/, "").split("/").pop()
+            const label = e.name + (clash ? "（" + suffix + "）" : "")
+            return { label, target: { page: "category", attributes: { category: label, param: e.path } } }
+        })
+    }
+
+    async refreshCatalog() {
+        if (this.catalogBusy) { UI.showMessage("目录正在刷新，请勿重复点击。"); return }
+        this.catalogBusy = true
+        try {
+            // One known HTML entry, no API guessing or per-album crawling.
+            const target = this.localizedPath(this.siteUrl)
+            const response = await Network.get(target, this.requestHeaders(target))
+            const body = String(response.body ?? "")
+            if (response.status === 403 || response.status === 429 || this.isCloudflareChallenge(response) ||
+                /<title>\s*Just a moment|captcha-form|\/sorry\/index|<title>[^<]*(?:login|sign in|登录)/i.test(body)) {
+                throw new Error("V2PH 目录访问受限（验证、登录或限流）。请先在本源 Login with webview 完成验证／登录；旧缓存已保留，不会继续重试。")
+            }
+            if (response.status < 200 || response.status >= 300) throw new Error("V2PH 目录 HTTP " + response.status + "；旧缓存已保留。")
+            const doc = new HtmlDocument(body), fresh = []
+            try { this.catalogCollect(doc, fresh, true) } finally { doc.dispose() }
+            if (!fresh.length) throw new Error("本次页面没有可识别的目录链接；旧缓存已保留，请反馈页面。")
+            // Merge only after successful parsing; include links learned while the request ran.
+            for (const entry of this.catalog) this.catalogAdd(fresh, entry.ns, entry.name, entry.path)
+            this.catalog = fresh
+            this.saveData("taxonomy_v2", this.catalog)
+            this.saveData("taxonomy_v2_status", { at: Date.now(), scope: "原站首页导航与浏览缓存，非全站目录" })
+            UI.showMessage("已缓存 " + this.catalog.length + " 项。请退出再进入分类页；只包含原站导航与已浏览内容，不代表全站目录。")
+        } catch (error) {
+            UI.showMessage(String(error?.message ?? error))
+        } finally { this.catalogBusy = false }
+    }
+
+    constructor() {
+        super()
+        const first = this.category.parts[0], vendors = [], categories = [], params = []
+        for (let i = 0; i < first.categories.length; i++) {
+            if (first.categoryParams[i].startsWith("/company/")) vendors.push({ label: first.categories[i], target: { page: "category", attributes: { category: first.categories[i], param: first.categoryParams[i] } } })
+            else { categories.push(first.categories[i]); params.push(first.categoryParams[i]) }
+        }
+        first.name = "常用快捷分类"
+        first.categories = categories; first.categoryParams = params
+        this.category.title = "V2PH 分类"
+        this.category.parts.push({ name: "厂商快捷入口", type: "fixed", categories: vendors })
+        for (const [ns, name] of [["Model", "已缓存人物／模特"], ["Vendor", "已缓存厂商／社团"], ["Tags", "已缓存标签"], ["Country", "已缓存地区"]]) {
+            // Register before native parsing. Loaders see the current data after init/refresh.
+            this.category.parts.push({ name, type: "dynamic", loader: () => this.catalogItems(ns) })
+        }
+        this.settings.refreshCatalog = { title: "刷新分类／标签目录", type: "callback", buttonText: "刷新目录", callback: () => this.refreshCatalog() }
+        this.settings.catalogStatus = { title: "目录缓存状态", type: "callback", buttonText: "查看状态", callback: () => {
+            const status = this.loadData("taxonomy_v2_status")
+            UI.showMessage("已缓存 " + this.catalog.length + " 项；最近手动刷新：" + (status?.at ? new Date(status.at).toISOString() : "尚未成功刷新") + "。仅导航与浏览记录，非全站目录；打开图集会自动积累真实链接。")
+        } }
+        this.settings.clearCatalog = { title: "清空目录缓存（不影响收藏、历史、登录）", type: "callback", buttonText: "清空目录", callback: () => {
+            if (this.catalogBusy) { UI.showMessage("请等待刷新结束。"); return }
+            this.catalog = []; this.saveData("taxonomy_v2", []); this.saveData("taxonomy_v2_status", {})
+            UI.showMessage("目录缓存已清空；收藏、历史、登录与当前阅读未修改。请重新进入分类页。")
+        } }
+        const listParser = this.parseAlbumList.bind(this)
+        this.parseAlbumList = doc => {
+            const result = listParser(doc)
+            for (const a of doc.querySelectorAll("a[href*='/album/']")) {
+                if (!this.catalogExcluded(a)) this.catalogCollect(this.nearestAlbumContainer(a))
+            }
+            return result
+        }
+        const detailParser = this.parseDetail.bind(this)
+        this.parseDetail = (doc, id) => {
+            const result = detailParser(doc, id)
+            for (const root of doc.querySelectorAll(".album-info, .album-detail, .album-meta")) this.catalogCollect(root)
+            return result
+        }
+        const click = this.comic.onClickTag
+        this.comic.onClickTag = (namespace, tag) => {
+            const ns = this.tagNamespace(namespace)
+            const item = this.catalog.find(e => e.ns === ns && e.name === this.cleanText(tag))
+            const livePath = this.storedTagLink(ns, tag)
+            if (!livePath && item) return { page: "category", attributes: { category: tag, param: item.path } }
+            return click(namespace, tag)
+        }
+    }
+
+    init() {
+        const saved = this.loadData("taxonomy_v2"), entries = []
+        for (const item of Array.isArray(saved) ? saved : []) {
+            if (item && typeof item.ns === "string" && typeof item.name === "string" && typeof item.path === "string") this.catalogAdd(entries, item.ns, item.name, item.path)
+        }
+        this.catalog = entries
+    }
+
     translation = {
         "zh_CN": {
             "Cloudflare / login note": "Cloudflare / 登录说明",
@@ -2096,4 +2256,3 @@ class PhotoDeckV2phSource extends ComicSource {
         "en": {}
     }
 }
-

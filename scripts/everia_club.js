@@ -3,7 +3,7 @@ class PhotoDeckEveriaClubSource extends ComicSource {
 
     key = "photo_deck_everia_club"
 
-    version = "0.2.3"
+    version = "0.2.4"
 
     minAppVersion = "1.17.0"
 
@@ -11,6 +11,10 @@ class PhotoDeckEveriaClubSource extends ComicSource {
     url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/everia_club.js"
 
     hosts = ["www.everiaclub.com", "everiaclub.com"]
+
+    // Public image sample: verify the domain that actually serves covers/pages.
+    // Native Venera captures cookies for the WebView's current URL only.
+    imageVerificationUrl = "https://files.pursue.cc/2026/10/07/921ddd3e801c438184e1ec3b8e86cbf5.jpg"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
@@ -27,25 +31,32 @@ class PhotoDeckEveriaClubSource extends ComicSource {
 
     account = {
         loginWithWebview: {
-            url: "https://www.everiaclub.com/",
+            url: this.imageVerificationUrl,
             checkStatus: (url, title) => {
                 const currentUrl = String(url ?? "")
                 const currentTitle = String(title ?? "").toLowerCase()
-                if (!/^https:\/\/(www\.)?everiaclub\.com\//i.test(currentUrl)) return false
+                if (currentUrl.split("?")[0].split("#")[0] !== this.imageVerificationUrl) return false
                 if (!currentTitle) return false
                 if (currentTitle.includes("just a moment")) return false
                 if (currentTitle.includes("attention required")) return false
                 if (currentTitle.includes("cloudflare")) return false
                 if (currentTitle.includes("403") || currentTitle.includes("forbidden")) return false
+                if (/404|not found|access denied|error|验证|验证中/.test(currentTitle)) return false
+                // A non-challenge title alone is insufficient: wait for the image document.
+                if (!/921ddd3e801c438184e1ec3b8e86cbf5\.jpg/i.test(currentTitle)) return false
                 this.webLoginStarted = true
                 return true
             },
             onLoginSuccess: async () => {
-                UI.showMessage("Everia Club session saved. Retry the source.")
+                const hasClearance = (Network.getCookies(this.imageVerificationUrl) ?? []).some(c => c.name === "cf_clearance" && c.value)
+                UI.showMessage(hasClearance
+                    ? "图片域名的验证状态已保存。请回到发现页刷新，实际封面能加载才算验证成功。"
+                    : "图片页面已打开，但未捕获到图片域名的 cf_clearance；可能无需验证或验证未完成。请回到发现页测试封面。")
             },
         },
         logout: () => {
             for (const host of this.hosts) Network.deleteCookies(`https://${host}/`)
+            Network.deleteCookies("https://files.pursue.cc/")
             UI.showMessage("Everia Club session cleared.")
         },
         registerWebsite: null
@@ -53,11 +64,20 @@ class PhotoDeckEveriaClubSource extends ComicSource {
 
     settings = {
         sessionHint: {
-            title: "Cloudflare note",
+            title: "封面／图片验证说明",
             type: "callback",
-            buttonText: "Show note",
+            buttonText: "查看步骤",
             callback: () => {
-                UI.showMessage("If Everia Club shows Cloudflare, open source account settings, use Login with webview, complete verification, then retry.")
+                UI.showMessage("封面与正文图片来自 files.pursue.cc，主站能打开不代表图片域名通过验证。请在本源账号设置使用 Login with webview，等待图片实际显示，再返回发现页刷新。若一直停在验证页或仍显示感叹号，请停止重复刷新并反馈；保存 Cookie 不等于图片已恢复。主站本身出现验证时需另外检查，不能靠此图片验证解决。")
+            }
+        },
+        imageSessionState: {
+            title: "图片验证状态",
+            type: "callback",
+            buttonText: "查看状态",
+            callback: () => {
+                const present = (Network.getCookies(this.imageVerificationUrl) ?? []).some(c => c.name === "cf_clearance" && c.value)
+                UI.showMessage(present ? "已保存图片域名的验证 Cookie（不展示内容）。是否有效请以封面实际加载为准。" : "尚未保存图片域名的验证 Cookie。请使用本源账号设置中的 Login with webview。")
             }
         }
     }
@@ -141,12 +161,12 @@ class PhotoDeckEveriaClubSource extends ComicSource {
     buildCookieHeader(url = this.siteUrl) {
         const parts = []
         const seen = {}
-        for (const base of [this.siteUrl, url]) {
-            for (const cookie of Network.getCookies(base) ?? []) {
-                if (!cookie?.name || !cookie?.value || seen[cookie.name]) continue
-                seen[cookie.name] = true
-                parts.push(`${cookie.name}=${cookie.value}`)
-            }
+        // Let the client's cookie jar match domain/path for this request only.
+        // Never copy main-site account cookies to an unrelated image host.
+        for (const cookie of Network.getCookies(url) ?? []) {
+            if (!cookie?.name || !cookie?.value || seen[cookie.name]) continue
+            seen[cookie.name] = true
+            parts.push(`${cookie.name}=${cookie.value}`)
         }
         return parts.join("; ")
     }
@@ -163,7 +183,9 @@ class PhotoDeckEveriaClubSource extends ComicSource {
 
     imageHeadersFor(url, referer = this.siteUrl) {
         const headers = {
-            "User-Agent": this.headers["User-Agent"],
+            // The native Cloudflare interceptor updates this lowercase key.
+            // Using both cases can accidentally send conflicting User-Agent headers.
+            "user-agent": this.headers["User-Agent"],
             "Accept": this.imageAccept,
             "Referer": referer || this.siteUrl
         }
@@ -198,7 +220,7 @@ class PhotoDeckEveriaClubSource extends ComicSource {
             try {
                 const response = await Network.get(target, this.requestHeaders(target, referer))
                 if (this.isCloudflareChallenge(response)) {
-                    throw "Everia Club Cloudflare verification required. Open this source account settings and use Login with webview once, then retry."
+                    throw "Everia 主站要求 Cloudflare 验证；当前 Login with webview 验证的是图片域名，不会解决主站验证。请停止重试并反馈具体页面。"
                 }
                 if (response.status >= 400) {
                     throw `Everia Club HTTP ${response.status}: ${target}`
@@ -1262,4 +1284,3 @@ class PhotoDeckEveriaClubSource extends ComicSource {
     }
 
 }
-
