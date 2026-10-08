@@ -1,6 +1,6 @@
 // Standalone VeneraNext source. No browser/GM globals or external imports.
 class PhotoDeckGraviaSource extends ComicSource {
-    version = "0.1.1"
+    version = "0.1.2"
     minAppVersion = "1.17.0"
     url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/gravia.js"
     labels = []
@@ -41,7 +41,9 @@ class PhotoDeckGraviaSource extends ComicSource {
         id = this.validId(id)
         if (!id) throw new Error(this.name + "：无效的作品 ID。")
         const cache = this.details[id]
-        if (cache && Date.now() - cache.at < 600000) return cache.value
+        // An inconsistent count may be transient while the site imports images.
+        // Retry only on a later detail visit, not in an automatic request loop.
+        if (cache && Date.now() - cache.at < (cache.value._countUncertain ? 30000 : 600000)) return cache.value
         if (this.pending[id]) return await this.pending[id]
         this.pending[id] = (async () => {
             const value = await this.fetchDetail(id)
@@ -98,24 +100,36 @@ class PhotoDeckGraviaSource extends ComicSource {
     async fetchDetail(id){
         const d=await this.request(this.api+"/api/boxes/"+id,true)
         if(String(d.id)!==id||!Array.isArray(d.images))throw new Error(this.name+"：图集接口结构已改变。")
-        const images=[],seen={}
+        const images=[],seen={},fallback={}
         for(const img of d.images){
+            if(!img||typeof img!=="object")throw new Error(this.name+"：正文图片字段异常。")
             const u=this.imageUrl(img.url),mid=this.imageUrl(img.midUrl)
             if(!u)throw new Error(this.name+"：正文图片地址缺失。")
             if(!seen[u]){seen[u]=true;images.push(u)}
-            if(mid&&mid!==u)this.fallback[u]=mid
+            if(mid&&mid!==u)fallback[u]=mid
         }
         if(!images.length)throw new Error(this.name+"：图集没有图片。")
-        if(Number(d.imageCount)!==d.images.length)throw new Error(this.name+"：图片数量与接口声明不一致，请稍后重试。")
+        const number=Number(d.imageCount)
+        const declared=d.imageCount!=null&&String(d.imageCount).trim()!==""&&Number.isInteger(number)&&number>=0?number:null
+        const uncertain=declared===null||declared!==images.length||d.images.length!==images.length
+        let countNote="已取得 "+images.length+" 张图片"
+        if(uncertain){
+            countNote+="\n数量提示："+(declared===null?"接口没有有效的声明数量":"接口标注 "+declared+" 张，当前返回 "+d.images.length+" 条图片记录")
+            if(d.images.length!==images.length)countNote+="，去重后 "+images.length+" 张"
+            countNote+="。当前完整性尚未确认，仅提供已取得的图片；请稍后重新打开详情核对，不会猜测或补造图片地址。"
+        }
+        // Publish fallbacks only after the complete response passed structural validation.
+        for(const u of Object.keys(fallback))this.fallback[u]=fallback[u]
         for(const t of d.tags||[])this.tagIds[t.name]=String(t.id)
         return {title:this.clean(d.title),cover:this.imageUrl(d.images[0].thumUrl||d.images[0].midUrl||d.images[0].url),
             tags:{"标签":(d.tags||[]).map(x=>x.name)},chapters:null,uploadTime:String(d.createdAt||"").slice(0,10),
             updateTime:String(d.updatedAt||"").slice(0,10),url:this.site+"/box/"+id,
-            description:d.imageCount+" 张图片"+(d.sourceUrl?"\n原始来源："+d.sourceUrl:""),images}
+            description:countNote+(d.sourceUrl?"\n原始来源："+d.sourceUrl:""),
+            _countUncertain:uncertain,_imageCountStatus:{declared,returned:d.images.length,actual:images.length},images}
     }
     async imageConfig(url,id){
         // Restored downloads may invoke the image callback before opening details.
-        if(!this.fallback[url]&&id)await this.getDetail(id)
+        if(!this.fallback[url]&&id&&!this.details[this.validId(id)]?.value)await this.getDetail(id)
         const config={url,headers:this.headers(true)},mid=this.fallback[url]
         if(mid&&mid!==url)config.onLoadFailed=()=>({url:mid,headers:this.headers(true)})
         return config
@@ -142,7 +156,13 @@ class PhotoDeckGraviaSource extends ComicSource {
     }
     comic={
         loadInfo:async id=>{const{images,...info}=await this.getDetail(id);return info},
-        loadEp:async(id,epId)=>({images:(await this.getDetail(id)).images}),
+        // Keep the opened detail's image order/count during reading. A later detail
+        // visit may refresh a short-lived uncertain response, without mid-read shifts.
+        loadEp:async(id,epId)=>{
+            const key=this.validId(id)
+            if(!key)throw new Error(this.name+"：无效的作品 ID。")
+            return {images:(this.details[key]?.value||await this.getDetail(key)).images}
+        },
         onThumbnailLoad:url=>({url,headers:this.headers(true)}),
         onImageLoad:(url,id,epId)=>this.imageConfig(url,id),
         onClickTag:(namespace,label)=>this.tagTarget(label,this.tagIds[label]||this.labels.find(t=>t.name===label)?.id||""),
@@ -158,5 +178,4 @@ class PhotoDeckGraviaSource extends ComicSource {
         }))
     ]}
 }
-
 

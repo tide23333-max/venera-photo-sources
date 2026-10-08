@@ -65,7 +65,7 @@
   {
     "name": "Gravia",
     "key": "photo_deck_gravia",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "fileName": "scripts/gravia.js",
     "description": "个人写真源；解析测试与客户端实测状态详见仓库文档"
   }
