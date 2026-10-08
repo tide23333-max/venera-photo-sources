@@ -3,7 +3,7 @@ class PhotoDeckGirlStopSource extends ComicSource {
 
     key = "photo_deck_girlstop"
 
-    version = "0.1.3"
+    version = "0.1.4"
 
     minAppVersion = "1.17.0"
 
@@ -11,19 +11,21 @@ class PhotoDeckGirlStopSource extends ComicSource {
     url = "https://raw.githubusercontent.com/tide23333-max/venera-photo-sources/main/scripts/girlstop.js"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
+        "user-agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://me.girlstop.info/"
     }
 
     imageHeaders = {
-        "User-Agent": this.headers["User-Agent"],
+        "user-agent": this.headers["user-agent"],
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Referer": "https://me.girlstop.info/"
     }
 
     detailCache = {}
+    sessionOrigin = ""
+    webLoginUrl = ""
 
     account = {
         loginWithWebview: {
@@ -31,33 +33,41 @@ class PhotoDeckGirlStopSource extends ComicSource {
             checkStatus: (url, title) => {
                 const currentUrl = String(url ?? "")
                 const currentTitle = String(title ?? "").toLowerCase()
-                if (!/https:\/\/(me|en|www)\.girlstop\.info\//i.test(currentUrl)) return false
+                if (!/^https:\/\/(me|en|www)\.girlstop\.info\//i.test(currentUrl)) return false
                 if (!currentTitle) return false
                 if (currentTitle.includes("just a moment")) return false
                 if (currentTitle.includes("attention required")) return false
                 if (currentTitle.includes("forbidden")) return false
                 if (currentTitle.includes("403")) return false
+                if (/cloudflare|blocked|access denied|captcha|验证/.test(currentTitle)) return false
+                this.webLoginUrl = currentUrl
                 return true
             },
             onLoginSuccess: async () => {
-                const cookies = await Network.getCookies(this.siteUrl)
-                if (cookies?.length) {
-                    Network.setCookies("https://me.girlstop.info/", cookies)
-                    Network.setCookies("https://en.girlstop.info/", cookies)
-                    Network.setCookies("https://www.girlstop.info/", cookies)
-                }
-                UI.showMessage("GirlStop Cloudflare verification saved. Retry the source.")
+                // Native Venera has saved cookies for the actual final WebView URL.
+                // Follow that verified origin; do not copy cookies between sibling hosts.
+                const origin = /^https:\/\/(?:me|en|www)\.girlstop\.info\//i.exec(this.webLoginUrl)?.[0] ?? ""
+                if (!origin) { UI.showMessage("未确认验证页面的域名，请重新打开源内验证窗口。"); return }
+                this.sessionOrigin = origin
+                this.saveData("girlstop_session_origin", origin)
+                this.detailCache = {}; this.catalogDetailTimes = {}; this.girlCategoryPages = {}
+                const cookies = Network.getCookies(this.webLoginUrl) ?? []
+                UI.showMessage(cookies.some(c => c.name === "cf_clearance" && c.value)
+                    ? "已保存实际验证域名的会话，请刷新 GirlStop。是否有效以实际加载为准。"
+                    : "页面已打开，但没有取得 cf_clearance。请刷新测试；若仍是 403，不要反复重试，反馈验证窗口画面。")
             },
         },
         logout: () => {
             Network.deleteCookies("https://me.girlstop.info/")
             Network.deleteCookies("https://en.girlstop.info/")
             Network.deleteCookies("https://www.girlstop.info/")
+            this.sessionOrigin = ""; this.webLoginUrl = ""
+            this.saveData("girlstop_session_origin", "")
         },
         registerWebsite: null
     }
 
-    absoluteUrl(url, base = this.siteUrl) {
+    absoluteUrl(url, base = this.sessionOrigin || this.siteUrl) {
         if (!url) return ""
         if (url.startsWith("http://") || url.startsWith("https://")) return url
         if (url.startsWith("//")) return "https:" + url
@@ -70,7 +80,13 @@ class PhotoDeckGirlStopSource extends ComicSource {
     }
 
     async getDocument(url) {
-        const response = await Network.get(this.absoluteUrl(url), this.headers)
+        const target = this.absoluteUrl(url)
+        const response = await Network.get(target, { ...this.headers, Referer: this.sessionOrigin || this.siteUrl })
+        const body = String(response.body ?? "")
+        if (/sorry, you have been blocked|you are unable to access/i.test(body) ||
+            (response.status === 403 && /cf-error-details/i.test(body))) {
+            throw "GirlStop 被网站安全规则阻止（403 封禁页），不是空图集。请在本源账号设置打开 WebView 确认；若同样被阻止，验证／改解析规则不能保证解除，请停止重复刷新。"
+        }
         if (this.isCloudflareChallenge(response)) {
             throw "GirlStop Cloudflare verification required. Open this source account settings and use Login with webview once, then retry."
         }
@@ -125,9 +141,14 @@ class PhotoDeckGirlStopSource extends ComicSource {
 
     parseMaxPage(doc) {
         let maxPage = 1
+        // Current website paginator uses zero-based query pages, but a total page count.
+        for (const script of doc.querySelectorAll("script")) {
+            const total = Number(/new\s+Paginator\s*\(\s*['"]pager['"]\s*,\s*(\d+)/.exec(script.text ?? "")?.[1] ?? "0")
+            if (total > maxPage) maxPage = total
+        }
         for (const item of doc.querySelectorAll("a[href*='page=']")) {
             const page = Number(/[?&]page=(\d+)/.exec(item.attributes.href ?? "")?.[1] ?? "0")
-            if (page > maxPage) maxPage = page
+            if (page + 1 > maxPage) maxPage = page + 1
         }
         return maxPage
     }
@@ -171,11 +192,19 @@ class PhotoDeckGirlStopSource extends ComicSource {
             .map((e) => this.cleanText(e.text))
             .filter((e) => e.length > 0 && e !== "...")
         const thumbs = []
+        const readerImages = []
+        const imageFallbacks = {}
         const photoItems = doc.querySelectorAll(".psto_item")
         for (const item of photoItems) {
-            const link = item.querySelector("a.full[href]") ?? item.querySelector("a[href*='/cat/posts/']")
+            const link = item.querySelector("a.fullimg[href], a.full[href]") ?? item.querySelector("a[href*='/cat/posts/']")
             const image = this.firstImageUrl(link ?? item)
             if (image && !thumbs.includes(image)) thumbs.push(image)
+            const href = this.absoluteImageUrl(link?.attributes?.href ?? "")
+            const full = /^https?:\/\/[^/]+\/cat\/posts\/[^?#]+\.(?:avif|webp|jpe?g|png)(?:[?#]|$)/i.test(href) ? href : image
+            if (full && !readerImages.includes(full)) {
+                readerImages.push(full)
+                if (image && image !== full) imageFallbacks[full] = image
+            }
         }
         if (thumbs.length === 0) {
             for (const image of doc.querySelectorAll("img.photo450")) {
@@ -184,6 +213,8 @@ class PhotoDeckGirlStopSource extends ComicSource {
                 if (imageUrl && !thumbs.includes(imageUrl)) thumbs.push(imageUrl)
             }
         }
+        if (!readerImages.length) readerImages.push(...thumbs)
+        if (!readerImages.length) throw "GirlStop 正文中没有可读取的图片，可能是验证页或页面结构变化。请反馈图集网址。"
         const rating = Number(this.parseInfoText(doc, /Rating:\s*([0-9]+(?:\.[0-9]+)?)/i) ?? "0")
         const pics = Number(this.parseInfoText(doc, /Pics:\s*(\d+)/i) ?? `${thumbs.length}`)
         return {
@@ -200,10 +231,13 @@ class PhotoDeckGirlStopSource extends ComicSource {
                 "main": "Photos"
             },
             thumbnails: thumbs,
+            // Private JS cache fields: previews stay separate from full reader URLs.
+            _readerImages: readerImages,
+            _imageFallbacks: imageFallbacks,
             uploadTime: "",
             updateTime: "",
             uploader: "GirlStop",
-            url: `${this.siteUrl}psto.php?id=${id}`,
+            url: this.absoluteUrl(`psto.php?id=${id}`),
             maxPage: pics || thumbs.length,
             stars: rating ? Math.min(5, rating / 2) : null
         }
@@ -214,11 +248,12 @@ class PhotoDeckGirlStopSource extends ComicSource {
             title: "GirlStop Latest",
             type: "multiPageComicList",
             load: async (page) => {
-                const doc = await this.getDocument(`index.php?page=${page ?? 1}`)
+                const current = Math.max(1, Number(page) || 1)
+                const doc = await this.getDocument(`index.php?page=${current - 1}`)
                 try {
                     return {
                         comics: this.parseAlbumList(doc),
-                        maxPage: this.parseMaxPage(doc)
+                        maxPage: Math.max(current, this.parseMaxPage(doc))
                     }
                 } finally {
                     doc.dispose()
@@ -288,6 +323,7 @@ class PhotoDeckGirlStopSource extends ComicSource {
     }
 
     searchPath(keyword, page) {
+        const sitePage = Math.max(1, Number(page) || 1) - 1
         const text = this.cleanText(keyword)
         const lower = text.toLowerCase()
         const tagMatch = /^tag\s*:\s*(.+)$/i.exec(text)
@@ -296,13 +332,13 @@ class PhotoDeckGirlStopSource extends ComicSource {
             .replace(/\s+/g, "-")
         const tagParam = this.tagSearchParams[tagName]
         if (tagMatch && tagParam) {
-            return `${tagParam}&page=${page ?? 1}`
+            return `${tagParam}&page=${sitePage}`
         }
         if (this.tagSearchParams[lower] && !text.includes(" ")) {
-            return `${this.tagSearchParams[lower]}&page=${page ?? 1}`
+            return `${this.tagSearchParams[lower]}&page=${sitePage}`
         }
         const model = encodeURIComponent(text.replace(/\s+/g, " "))
-        return `models.php?name=${model}&page=${page ?? 1}`
+        return `models.php?name=${model}&page=${sitePage}`
     }
 
     search = {
@@ -311,7 +347,7 @@ class PhotoDeckGirlStopSource extends ComicSource {
             try {
                 return {
                     comics: this.parseAlbumList(doc),
-                    maxPage: this.parseMaxPage(doc)
+                    maxPage: Math.max(1, Number(page) || 1, this.parseMaxPage(doc))
                 }
             } finally {
                 doc.dispose()
@@ -332,28 +368,25 @@ class PhotoDeckGirlStopSource extends ComicSource {
             }
         },
         loadEp: async (id, ep) => {
-            const cachedImages = this.detailCache[id]?.thumbnails
+            const cachedImages = this.detailCache[id]?._readerImages
             if (cachedImages?.length) {
                 return {
                     images: cachedImages
                 }
             }
-            const doc = await this.getDocument(`psto.php?id=${id}`)
-            try {
-                const detail = this.parseDetail(doc, id)
-                this.detailCache[id] = detail
-                return {
-                    images: detail.thumbnails
-                }
-            } finally {
-                doc.dispose()
-            }
+            const detail = await this.comic.loadInfo(id)
+            return { images: detail._readerImages }
         },
         onImageLoad: async (imageKey, id, ep) => {
-            return {
+            const fallback = this.detailCache[id]?._imageFallbacks?.[imageKey]
+            const config = {
                 url: imageKey,
                 headers: this.imageHeaders
             }
+            // Use only the preview URL actually present in this article; never guess paths.
+            // Returned fallback has no failure callback, so it cannot cycle back to the original.
+            if (fallback && fallback !== imageKey) config.onLoadFailed = () => ({ url: fallback, headers: this.imageHeaders })
+            return config
         },
         onThumbnailLoad: (imageKey) => {
             return {
@@ -569,6 +602,8 @@ class PhotoDeckGirlStopSource extends ComicSource {
     }
     constructor(){super();this.catalogInstall()}
     init(){
+        const origin=this.loadData("girlstop_session_origin")
+        this.sessionOrigin=/^https:\/\/(?:me|en|www)\.girlstop\.info\/$/i.test(String(origin ?? ""))?origin:""
         const saved=this.loadData("taxonomy_v1")
         this.catalog=Array.isArray(saved)?saved.filter(e=>e&&e.ns&&e.label&&this.catalogPath(e.path)):[]
     }
@@ -576,6 +611,7 @@ class PhotoDeckGirlStopSource extends ComicSource {
         this.catalogLegacy=this.category
         this.catalogRefreshView()
         this.settings={...(this.settings||{}),
+            sessionHint:{title:"403／网站验证说明",type:"callback",buttonText:"查看说明",callback:()=>UI.showMessage("本源账号设置的 WebView 会保存实际打开域名的会话。若出现 Sorry, you have been blocked，这是网站封禁页，不能当作空图集或验证成功；停止重复刷新。源更新不会自动解除网络／网站限制。")},
             refreshCatalog:{title:"刷新分类／标签目录",type:"callback",buttonText:"刷新目录",callback:()=>this.refreshCatalog()},
             catalogStatus:{title:"目录缓存状态",type:"callback",buttonText:"查看状态",callback:()=>UI.showMessage("已缓存 "+this.catalog.length+" 项；仅已取得的公开目录与浏览记录，不保证全站完整。")},
             clearCatalog:{title:"清空分类／标签缓存（不影响收藏与历史）",type:"callback",buttonText:"清空目录",callback:()=>{
@@ -638,4 +674,3 @@ class PhotoDeckGirlStopSource extends ComicSource {
     }
 
 }
-
