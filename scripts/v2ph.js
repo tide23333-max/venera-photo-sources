@@ -3,7 +3,7 @@ class PhotoDeckV2phSource extends ComicSource {
 
     key = "photo_deck_v2ph"
 
-    version = "0.3.30"
+    version = "0.3.32"
 
     minAppVersion = "1.17.0"
 
@@ -19,7 +19,7 @@ class PhotoDeckV2phSource extends ComicSource {
     ]
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
+        "user-agent": "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7,ja;q=0.6",
         "Referer": "https://www.v2ph.com/"
@@ -112,7 +112,7 @@ class PhotoDeckV2phSource extends ComicSource {
             type: "callback",
             buttonText: "Show note",
             callback: () => {
-                UI.showMessage("Open source account settings, use Login with webview, finish Cloudflare and V2PH login, then retry. This config does not bypass Cloudflare automatically.")
+                UI.showMessage("Cloudflare 验证与账号登录是两种状态。出现验证入口时先完成验证再重试；只有原站明确要求登录时才重新登录。普通 error 或 HTTP 403 不等于账号过期。此源不会自动延长 Cookie，也不会在启动时清除会话。")
             }
         }
     }
@@ -870,7 +870,7 @@ class PhotoDeckV2phSource extends ComicSource {
 
     imageHeadersFor(url, referer = this.siteUrl) {
         const headers = {
-            "User-Agent": this.headers["User-Agent"],
+            "user-agent": this.headers["user-agent"],
             "Accept": this.imageAccept,
             "Referer": referer || this.siteUrl
         }
@@ -880,6 +880,18 @@ class PhotoDeckV2phSource extends ComicSource {
     deleteCookiesFromKnownHosts() {
         for (const host of this.hosts) {
             Network.deleteCookies(`https://${host}/`)
+        }
+    }
+
+    // Venera's bridge returns transport/Cloudflare failures in response.error.
+    // Preserve its native verification marker instead of parsing an empty body.
+    checkResponseError(response, target) {
+        if (/CloudflareException:\s*/.test(String(response?.error ?? "")) || this.isCloudflareChallenge(response)) {
+            throw `CloudflareException: ${target}`
+        }
+        if (response?.error) throw "V2PH 网络请求失败；请检查网络后重试。未清除登录记录。"
+        if (!Number.isInteger(response?.status) || response.status < 100 || response.status > 599) {
+            throw "V2PH 未取得有效 HTTP 响应；不能据此判断账号已失效。"
         }
     }
 
@@ -928,11 +940,9 @@ class PhotoDeckV2phSource extends ComicSource {
     async getDocument(path, referer = this.siteUrl) {
         const target = this.absoluteUrl(this.localizedPath(path))
         const response = await Network.get(target, this.requestHeaders(target, referer))
-        if (this.isCloudflareChallenge(response)) {
-            throw "V2PH Cloudflare verification required. Open this source account settings and use Login with webview once, then retry."
-        }
+        this.checkResponseError(response, target)
         if (response.status === 403) {
-            throw "V2PH HTTP 403: login or Cloudflare verification required. Use Login with webview first."
+            throw "V2PH HTTP 403：站点拒绝访问，不能确定是登录过期。未清除 Cookie；请检查原站是否要求验证。"
         }
         if (response.status >= 400) {
             throw `V2PH HTTP ${response.status}: ${target}`
@@ -966,6 +976,9 @@ class PhotoDeckV2phSource extends ComicSource {
                 lastError = error
                 if (message.includes("HTTP 404") ||
                     message.includes("HTTP 403") ||
+                    message.includes("HTTP 401") ||
+                    message.includes("HTTP 429") ||
+                    message.includes("CloudflareException:") ||
                     message.toLowerCase().includes("login") ||
                     message.toLowerCase().includes("quota") ||
                     message.toLowerCase().includes("vip")) {
@@ -2155,6 +2168,7 @@ class PhotoDeckV2phSource extends ComicSource {
             // One known HTML entry, no API guessing or per-album crawling.
             const target = this.localizedPath(this.siteUrl)
             const response = await Network.get(target, this.requestHeaders(target))
+            this.checkResponseError(response, this.absoluteUrl(target))
             const body = String(response.body ?? "")
             if (response.status === 403 || response.status === 429 || this.isCloudflareChallenge(response) ||
                 /<title>\s*Just a moment|captcha-form|\/sorry\/index|<title>[^<]*(?:login|sign in|登录)/i.test(body)) {
