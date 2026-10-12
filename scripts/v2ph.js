@@ -3,7 +3,7 @@ class PhotoDeckV2phSource extends ComicSource {
 
     key = "photo_deck_v2ph"
 
-    version = "0.3.32"
+    version = "0.3.33"
 
     minAppVersion = "1.17.0"
 
@@ -895,6 +895,39 @@ class PhotoDeckV2phSource extends ComicSource {
         }
     }
 
+    isRedirectError(error) {
+        return /RhttpRedirectException|RedirectException|too many redirects|redirect limit exceeded/i.test(String(error ?? ""))
+    }
+
+    async getSiteResponse(target, referer = this.siteUrl) {
+        const headers = this.requestHeaders(target, referer)
+        let response
+        try {
+            response = await Network.get(target, headers)
+            this.checkResponseError(response, target)
+            return response
+        } catch (error) {
+            // Network.get throws bridge errors before a response is returned.
+            if (!this.isRedirectError(error) && !this.isRedirectError(response?.error)) throw error
+        }
+        // Only a redirect failure qualifies. No cookie deletion, domain switch,
+        // persistent engine switch, or unbounded retry; the native jar stays in use.
+        try {
+            const fallback = await Network.get(target, {...headers, http_client: "dart:io"})
+            if (this.isRedirectError(fallback?.error)) {
+                throw "V2PH Redirect error：默认与备用通道均无法完成跳转。请在 WebView 检查原站是否要求登录；未清除 Cookie，不会继续重试。"
+            }
+            this.checkResponseError(fallback, target)
+            return fallback
+        } catch (error) {
+            if (this.isRedirectError(error)) {
+                throw "V2PH Redirect error：备用请求仍无法完成跳转。请在 WebView 检查原站状态；未清除 Cookie，不会继续重试。"
+            }
+            if (String(error).includes("CloudflareException:")) throw error
+            throw "V2PH Redirect error：默认通道跳转失败，备用通道也未能取得网页。请检查网络或在 WebView 核对原站状态；未清除 Cookie，不会继续重试。"
+        }
+    }
+
     isCloudflareChallenge(response) {
         const headers = response?.headers ?? {}
         const mitigated = String(headers["cf-mitigated"] ?? headers["Cf-Mitigated"] ?? headers["CF-Mitigated"] ?? "").toLowerCase()
@@ -939,8 +972,7 @@ class PhotoDeckV2phSource extends ComicSource {
 
     async getDocument(path, referer = this.siteUrl) {
         const target = this.absoluteUrl(this.localizedPath(path))
-        const response = await Network.get(target, this.requestHeaders(target, referer))
-        this.checkResponseError(response, target)
+        const response = await this.getSiteResponse(target, referer)
         if (response.status === 403) {
             throw "V2PH HTTP 403：站点拒绝访问，不能确定是登录过期。未清除 Cookie；请检查原站是否要求验证。"
         }
@@ -979,6 +1011,7 @@ class PhotoDeckV2phSource extends ComicSource {
                     message.includes("HTTP 401") ||
                     message.includes("HTTP 429") ||
                     message.includes("CloudflareException:") ||
+                    message.includes("Redirect error") ||
                     message.toLowerCase().includes("login") ||
                     message.toLowerCase().includes("quota") ||
                     message.toLowerCase().includes("vip")) {
@@ -1578,7 +1611,7 @@ class PhotoDeckV2phSource extends ComicSource {
                 const message = String(error)
                 if (!message.includes("HTTP 404") && !message.includes("Page not found") && !message.includes("detailUrlInvalid")) {
                     // Try other known URL styles before surfacing a soft parse issue.
-                    if (message.includes("Cloudflare") || message.includes("login") || message.includes("403")) throw error
+                    if (message.includes("Cloudflare") || message.includes("login") || message.includes("403") || message.includes("HTTP 401") || message.includes("HTTP 429") || message.includes("Redirect error")) throw error
                 }
             } finally {
                 doc?.dispose()
@@ -1690,6 +1723,9 @@ class PhotoDeckV2phSource extends ComicSource {
     isHardDetailPageError(error) {
         const message = String(error ?? "").toLowerCase()
         return message.includes("cloudflare") ||
+            message.includes("redirect error") ||
+            message.includes("http 401") ||
+            message.includes("http 429") ||
             message.includes("login") ||
             message.includes("403") ||
             message.includes("quota") ||
@@ -2167,8 +2203,7 @@ class PhotoDeckV2phSource extends ComicSource {
         try {
             // One known HTML entry, no API guessing or per-album crawling.
             const target = this.localizedPath(this.siteUrl)
-            const response = await Network.get(target, this.requestHeaders(target))
-            this.checkResponseError(response, this.absoluteUrl(target))
+            const response = await this.getSiteResponse(this.absoluteUrl(target))
             const body = String(response.body ?? "")
             if (response.status === 403 || response.status === 429 || this.isCloudflareChallenge(response) ||
                 /<title>\s*Just a moment|captcha-form|\/sorry\/index|<title>[^<]*(?:login|sign in|登录)/i.test(body)) {
