@@ -3,7 +3,7 @@ class PhotoDeckV2phSource extends ComicSource {
 
     key = "photo_deck_v2ph"
 
-    version = "0.3.33"
+    version = "0.3.41"
 
     minAppVersion = "1.17.0"
 
@@ -42,6 +42,10 @@ class PhotoDeckV2phSource extends ComicSource {
     lastRawBody = ""
 
     lastSourceUrl = ""
+
+    captchaTask = null
+    captchaPaused = false
+    captchaPauseUntil = 0
 
     tagLinkMap = {}
 
@@ -107,6 +111,15 @@ class PhotoDeckV2phSource extends ComicSource {
     }
 
     settings = {
+        resumeCaptcha: {
+            title: "继续图片验证码验证",
+            type: "callback",
+            buttonText: "继续验证",
+            callback: () => {
+                this.captchaPaused = false
+                UI.showMessage("请重新打开写真，手动填写网站图片验证码。")
+            }
+        },
         sessionHint: {
             title: "Cloudflare / login note",
             type: "callback",
@@ -260,7 +273,6 @@ class PhotoDeckV2phSource extends ComicSource {
         // Use split/join so list covers and detail images do not crash in imageUrl().
         text = text.split("&amp;").join("&")
         text = text.split("\\u002F").join("/")
-        text = text.split("\u002F").join("/")
         text = text.split("\\/").join("/")
         text = text.split("\\").join("/")
         return text
@@ -588,25 +600,12 @@ class PhotoDeckV2phSource extends ComicSource {
             }
         }
 
-        // Conservative text fallback for count only. Prefer dedicated info blocks;
-        // scanning the whole main/body can pick up Related Galleries counts.
-        for (const root of roots) {
-            const count = this.extractImageCount(root.text)
-            if (count && (!result.imageCount || count > result.imageCount)) result.imageCount = count
-        }
+        result.imageCount = this.extractExpectedCount(doc)
 
         result.models = this.uniqueValues(result.models)
         result.tags = this.uniqueValues(result.tags)
         result.vendors = this.uniqueValues(result.vendors)
         return result
-    }
-
-    pageFromHref(href) {
-        const value = String(href ?? "").split("&amp;").join("&")
-        const queryPage = Number(/[?&](?:page|p|paged)=(\d+)/i.exec(value)?.[1] ?? "0")
-        const pathPage = Number(/\/page\/(\d+)\/?/i.exec(value)?.[1] ?? "0")
-        const slashPage = Number(/\/(\d+)\/?(?:[?#].*)?$/i.exec(value)?.[1] ?? "0")
-        return Math.max(queryPage, pathPage, slashPage)
     }
 
     listPageFromHref(href) {
@@ -862,10 +861,13 @@ class PhotoDeckV2phSource extends ComicSource {
     }
 
     requestHeaders(url = this.siteUrl, referer = this.siteUrl) {
-        return {
+        const headers = {
             ...this.headers,
             "Referer": referer || this.siteUrl
         }
+        // Do not reuse a cached restriction page after the user fixes connectivity.
+        if (/\/album\//i.test(String(url))) headers["cache-time"] = "no"
+        return headers
     }
 
     imageHeadersFor(url, referer = this.siteUrl) {
@@ -970,8 +972,89 @@ class PhotoDeckV2phSource extends ComicSource {
             body.includes("limit exceeded")
     }
 
-    async getDocument(path, referer = this.siteUrl) {
+    async completeAlbumCaptcha(form, target) {
+        if (this.captchaPaused && Date.now() < this.captchaPauseUntil) throw "V2PH Captcha error：验证已暂停，请稍候点击当前页面重试。"
+        this.captchaPaused = false
+        if (this.captchaTask) return this.captchaTask
+        const task = (async () => {
+            const host = /^https:\/\/([^/]+)\/album\//i.exec(target)?.[1]?.toLowerCase()
+            const action = String(form.attributes?.action ?? "").trim()
+            if (!this.hosts.includes(host) || host === "cdn.v2ph.com" || (action && this.absoluteUrl(action) !== target)) {
+                throw "V2PH Captcha error：验证表单地址无法确认，未提交验证码。"
+            }
+            let captchaForm = form
+            let refreshDoc = null
+            let prompt = "V2PH：请手动输入图片验证码"
+            try {
+                while (true) {
+                    const captchaId = captchaForm.querySelectorAll("input[name='captcha_id']")
+                        .map((node) => String(node.attributes?.value ?? "")).filter(Boolean).pop()
+                    const image = String(captchaForm.querySelector("img")?.attributes?.src ?? "")
+                    const imageData = /^data:image\/(?:png|jpe?g|webp);base64,([A-Za-z0-9+/=\s]+)$/i.exec(image)?.[1]
+                    if (!captchaId || captchaId.length > 512 || /[\r\n]/.test(captchaId) || !imageData || imageData.length > 1000000) {
+                        throw "V2PH Captcha error：网站验证码结构变化，未提交。"
+                    }
+                    const code = await UI.showInputDialog(prompt, (value) => {
+                        const text = String(value ?? "").trim()
+                        return text && text.length <= 32 && !/[\r\n]/.test(text) ? null : "请输入图片中的验证码"
+                    }, Convert.decodeBase64(imageData))
+                    if (code == null) throw "V2PH Captcha error：你取消了验证码；稍候点击当前页面重试可重新填写。"
+                    const boundary = "----VeneraV2ph" + Date.now()
+                    const fields = { captcha_id: captchaId, captcha_code: String(code).trim(), submit: "提交" }
+                    const data = Object.keys(fields).map((name) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${fields[name]}\r\n`).join("") + `--${boundary}--\r\n`
+                    const response = await Network.post(target, {
+                        ...this.requestHeaders(target, target),
+                        "Content-Type": "multipart/form-data; boundary=" + boundary
+                    }, data, { maskHeadersInLog: ["cookie"], maskDataInLog: true })
+                    this.checkResponseError(response, target)
+                    if (response.status >= 400) throw "V2PH Captcha error：网站未接受验证提交，请检查网络后再手动验证。"
+                    const result = new HtmlDocument(String(response.body ?? ""))
+                    try {
+                        if (result.querySelector("form#album-captcha-form input[name='captcha_code']")) {
+                            const choice = await UI.showSelectDialog("验证码未通过，是否换一张？", ["换一张，重新填写", "取消"], 0)
+                            if (choice !== 0) throw "V2PH Captcha error：验证已取消；稍候点击当前页面重试。"
+                            const refreshed = await this.getSiteResponse(target, target)
+                            if (refreshed.status >= 400) throw `V2PH Captcha error：换图请求失败，HTTP ${refreshed.status}。`
+                            refreshDoc?.dispose()
+                            refreshDoc = new HtmlDocument(String(refreshed.body ?? ""))
+                            captchaForm = refreshDoc.querySelector("form#album-captcha-form")
+                            if (!captchaForm?.querySelector("input[name='captcha_code']")) {
+                                if (this.documentBelongsToAlbum(refreshDoc, this.extractAlbumId(target)) && (this.extractDetailImages(refreshDoc).length || this.looksLikeVipLimited(refreshDoc))) return
+                                throw "V2PH Captcha error：未取得新的验证码，请稍候在当前页重试。"
+                            }
+                            prompt = "V2PH：已换新图，请重新输入验证码"
+                            continue
+                        }
+                        if (!this.documentBelongsToAlbum(result, this.extractAlbumId(target)) || (!this.extractDetailImages(result).length && !this.looksLikeVipLimited(result))) {
+                            throw "V2PH Captcha error：网站未返回图集，请稍候在当前页重试。"
+                        }
+                        return
+                    } finally {
+                        result.dispose()
+                    }
+                }
+            } finally {
+                refreshDoc?.dispose()
+            }
+        })()
+        this.captchaTask = task
+        try {
+            return await task
+        } catch (error) {
+            this.captchaPaused = true
+            this.captchaPauseUntil = Date.now() + 2000
+            throw error
+        } finally {
+            if (this.captchaTask === task) this.captchaTask = null
+        }
+    }
+
+    async getDocument(path, referer = this.siteUrl, captchaRetried = false) {
         const target = this.absoluteUrl(this.localizedPath(path))
+        if (this.captchaPaused && /\/album\//i.test(target)) {
+            if (Date.now() < this.captchaPauseUntil) throw "V2PH Captcha error：验证码待完成，稍候点击当前页面重试即可换图填写。"
+            this.captchaPaused = false
+        }
         const response = await this.getSiteResponse(target, referer)
         if (response.status === 403) {
             throw "V2PH HTTP 403：站点拒绝访问，不能确定是登录过期。未清除 Cookie；请检查原站是否要求验证。"
@@ -990,6 +1073,21 @@ class PhotoDeckV2phSource extends ComicSource {
         } catch (_) {
             // Some native HtmlDocument wrappers may not accept custom fields;
             // rawBodyCache keeps a fallback by source URL.
+        }
+        const captcha = doc.querySelector("form#album-captcha-form")
+        if (captcha?.querySelector("input[name='captcha_code']")) {
+            if (captchaRetried) {
+                this.captchaPaused = true
+                this.captchaPauseUntil = Date.now() + 2000
+                doc.dispose()
+                throw "V2PH Captcha error：提交后网站仍要求验证码，已停止；稍候点击当前页面重试。"
+            }
+            try {
+                await this.completeAlbumCaptcha(captcha, target)
+            } finally {
+                doc.dispose()
+            }
+            return this.getDocument(target, referer, true)
         }
         if (this.looksLikeQuotaExceeded(doc)) {
             doc.dispose()
@@ -1012,6 +1110,7 @@ class PhotoDeckV2phSource extends ComicSource {
                     message.includes("HTTP 429") ||
                     message.includes("CloudflareException:") ||
                     message.includes("Redirect error") ||
+                    message.includes("Captcha error") ||
                     message.toLowerCase().includes("login") ||
                     message.toLowerCase().includes("quota") ||
                     message.toLowerCase().includes("vip")) {
@@ -1432,18 +1531,6 @@ class PhotoDeckV2phSource extends ComicSource {
         return doc.querySelector(".photos-list") != null || doc.querySelector(".album-photos") != null
     }
 
-    extractNumbers(text) {
-        const values = []
-        const source = String(text ?? "")
-        const pattern = /\d+/g
-        let match = null
-        while ((match = pattern.exec(source)) !== null) {
-            const value = Number(match[0])
-            if (value > 0 && value < 10000) values.push(value)
-        }
-        return values
-    }
-
     addPhotoCountMatches(values, text) {
         const source = this.cleanText(text)
         const patterns = [
@@ -1463,42 +1550,42 @@ class PhotoDeckV2phSource extends ComicSource {
     }
 
     extractExpectedCount(doc, firstPageImageCount = 0) {
-        const values = []
         const pageSize = Number(firstPageImageCount ?? 0)
-
-        // Prefer explicit Photos/P count in the album information area. Do not scan
-        // generic .content/body: V2PH puts Related Galleries after the current album
-        // and those titles contain 40P/100P/etc.
-        for (const node of doc.querySelectorAll("dl, .album-info, .album-detail, .detail")) {
-            this.addPhotoCountMatches(values, node.text)
+        const root = doc.querySelector("main") ?? doc.querySelector("article") ?? doc.body
+        const roots = (root?.querySelectorAll(".album-info, .album-detail, .album-meta, .detail, dl") ?? [])
+            .filter((node) => !this.imageInsideNonAlbumArea(node))
+        const uniqueCount = (values) => {
+            const numbers = this.uniqueValues(values.map(String)).map(Number)
+                .filter((value) => Number.isInteger(value) && value >= Math.max(1, pageSize) && value < 10000)
+            return numbers.length === 1 ? numbers[0] : null
         }
-
-        // Last-resort compatibility with older V2PH markup where dd:last-child was
-        // the photo count.  Only accept it when it is plausible for the current page.
-        const dd = doc.querySelectorAll("dd")
-        if (dd.length) {
-            const ddText = this.cleanText(dd[dd.length - 1].text)
-            const ddNumbers = this.extractNumbers(ddText)
-            for (const value of ddNumbers) {
-                if (!pageSize || value >= pageSize) values.push(value)
+        const labelled = []
+        const countLabel = /^(?:photos?|pics?|pictures?|照片|圖片|图片|圖片數量|图片数量|写真枚数|画像数|枚数|頁數|页数|張數|张数)\s*[:：]?$/i
+        for (const info of roots) {
+            for (const label of info.querySelectorAll("dt, th, .label, .key, .name")) {
+                if (this.imageInsideNonAlbumArea(label)) continue
+                if (!countLabel.test(this.cleanText(label.text))) continue
+                const text = this.cleanText(label.nextElementSibling?.text)
+                const match = /^(?:P\s*)?(\d+)\s*(?:P|photos?|pictures?|pics?|张|張|枚)?$/i.exec(text)
+                if (match) labelled.push(Number(match[1]))
             }
         }
-
-        const titleText = this.cleanText(doc.querySelector("title")?.text)
-        const ogTitle = this.cleanText(doc.querySelector("meta[property='og:title']")?.attributes?.content)
-        this.addPhotoCountMatches(values, `${titleText} ${ogTitle}`)
-
-        const strongValues = values
-            .map((value) => Number(value))
-            .filter((value) => value > 0 && value < 10000)
-
-        if (!strongValues.length) return null
-
-        // The real total must normally be at least the first page image count.
-        // If every candidate is smaller than one full page, treat it as unreliable.
-        const reliable = pageSize > 0 ? strongValues.filter((value) => value >= pageSize) : strongValues
-        if (reliable.length) return Math.max(...reliable)
-        return Math.max(...strongValues)
+        if (labelled.length) return uniqueCount(labelled)
+        const scoped = []
+        for (const info of roots) {
+            this.addPhotoCountMatches(scoped, info.text)
+            // Legacy unlabelled dl: accept a plain final dd, not dates or arbitrary text.
+            if (!info.querySelector("dt, th, .label, .key, .name")) {
+                const dd = info.querySelectorAll("dd")
+                const match = /^(\d+)\s*(?:P|photos?|张|張|枚)?$/i.exec(this.cleanText(dd[dd.length - 1]?.text))
+                if (match && (dd.length === 1 || /P|photos?|张|張|枚/i.test(match[0]))) scoped.push(Number(match[1]))
+            }
+        }
+        if (scoped.length) return uniqueCount(scoped)
+        const titleCounts = []
+        this.addPhotoCountMatches(titleCounts, doc.querySelector("title")?.text)
+        this.addPhotoCountMatches(titleCounts, doc.querySelector("meta[property='og:title']")?.attributes?.content)
+        return uniqueCount(titleCounts)
     }
 
 
@@ -1577,21 +1664,29 @@ class PhotoDeckV2phSource extends ComicSource {
                     continue
                 }
                 if (!this.documentBelongsToAlbum(doc, albumId)) {
-                    doc.dispose()
+                    throw `V2PH Album page error：网页第 ${page} 页返回了其他图集，已停止读取。`
+                }
+                const images = this.extractDetailImages(doc)
+                if (this.looksLikeVipLimited(doc)) {
+                    const result = { doc, url, style: candidate.style, images, vipLimited: true }
                     doc = null
-                    lastError = `V2PH detailUrlInvalid: ${url}`
-                    continue
+                    bestResult?.doc?.dispose()
+                    emptyResult?.doc?.dispose()
+                    return result
                 }
                 if (this.looksLikeLoginRequired(doc)) {
                     throw "V2PH login is required. Use Login with webview from this source account settings."
                 }
-                const images = this.extractDetailImages(doc)
+                if (!images.length && !this.hasPhotosList(doc)) {
+                    throw `V2PH Album page error：网页第 ${page} 页没有图集图片区，可能是验证／限制页或站点结构变化；未保存残缺阅读缓存。`
+                }
                 if (images.length) {
                     const newCount = images.filter((image) => !known[image]).length
                     const result = { doc, url, style: candidate.style, images }
                     doc = null
                     if (newCount > 0) {
                         bestResult?.doc?.dispose()
+                        emptyResult?.doc?.dispose()
                         this.albumUrlStyle[albumId] = candidate.style
                         return result
                     }
@@ -1602,6 +1697,10 @@ class PhotoDeckV2phSource extends ComicSource {
                     }
                     continue
                 }
+                const lastPage = this.detailLastPage(doc, albumId)
+                if (!lastPage || page < lastPage) {
+                    throw `V2PH Album page error：网页第 ${page} 页没有有效图片，无法确认已到末页；未保存残缺阅读缓存。`
+                }
                 if (!emptyResult) {
                     emptyResult = { doc, url, style: candidate.style, images: [] }
                     doc = null
@@ -1609,9 +1708,11 @@ class PhotoDeckV2phSource extends ComicSource {
             } catch (error) {
                 lastError = error
                 const message = String(error)
-                if (!message.includes("HTTP 404") && !message.includes("Page not found") && !message.includes("detailUrlInvalid")) {
-                    // Try other known URL styles before surfacing a soft parse issue.
-                    if (message.includes("Cloudflare") || message.includes("login") || message.includes("403") || message.includes("HTTP 401") || message.includes("HTTP 429") || message.includes("Redirect error")) throw error
+                // Alternate URL styles are for real 404s, not failed or restricted pages.
+                if (!message.includes("HTTP 404") && !message.includes("Page not found")) {
+                    bestResult?.doc?.dispose()
+                    emptyResult?.doc?.dispose()
+                    throw error
                 }
             } finally {
                 doc?.dispose()
@@ -1619,11 +1720,41 @@ class PhotoDeckV2phSource extends ComicSource {
         }
 
         if (bestResult) {
+            emptyResult?.doc?.dispose()
             this.albumUrlStyle[albumId] = bestResult.style
             return bestResult
         }
         if (emptyResult) return emptyResult
         throw lastError ?? `V2PH album page not found: ${albumId}`
+    }
+
+    detailLastPage(doc, id) {
+        const albumId = this.normalizeAlbumId(id)
+        for (const link of doc.querySelectorAll(".pagination a[href], .pager a[href], a[rel='last']")) {
+            if (this.imageInsideNonAlbumArea(link)) continue
+            const text = this.cleanText(link.text)
+            const rel = String(link.attributes?.rel ?? "")
+            const title = this.cleanText(link.attributes?.title)
+            if (!/\blast\b/i.test(rel) && !/^(?:last|末页|末頁|尾页|尾頁|最后一页|最後一頁|最終ページ)$/i.test(text || title)) continue
+            const href = String(link.attributes?.href ?? "")
+            if (/^https?:\/\//i.test(href) && !this.hosts.includes(href.replace(/^https?:\/\//i, "").split("/")[0].toLowerCase())) continue
+            if (!href.startsWith("?") && this.extractAlbumId(href) !== albumId) continue
+            const page = Number(/[?&]page=(\d+)/i.exec(href)?.[1] ?? /\/(\d+)\.html(?:[?#]|$)/i.exec(href)?.[1] ?? "0")
+            if (page > 0 && page <= 500) return page
+        }
+        // A current page and explicitly disabled Next button are an actual end signal.
+        for (const pager of doc.querySelectorAll(".pagination, .pager")) {
+            if (this.imageInsideNonAlbumArea(pager)) continue
+            if (pager.querySelectorAll("a[href]").some((link) => {
+                const linkedId = this.extractAlbumId(link.attributes?.href)
+                return linkedId && linkedId !== albumId
+            })) continue
+            const current = this.cleanText(pager.querySelector("[aria-current='page'], .active")?.text)
+            const disabledNext = pager.querySelectorAll(".disabled, [aria-disabled='true']")
+                .some((node) => /^(?:next|下一页|下一頁|次へ|›|»|>)$/i.test(this.cleanText(node.text)) || this.classList(node).includes("next"))
+            if (disabledNext && /^\d+$/.test(current) && Number(current) <= 500) return Number(current)
+        }
+        return 0
     }
 
     detailPageNumbers(doc, id) {
@@ -1662,11 +1793,12 @@ class PhotoDeckV2phSource extends ComicSource {
     }
 
     looksLikeVipLimited(doc) {
-        const body = this.cleanText(doc?.body?.text).toLowerCase()
-        if (body.includes("vip限定") || body.includes("vip only") || body.includes("vip required") || body.includes("upgrade to vip")) return true
-        for (const node of doc.querySelectorAll("div.lead, .lead, .alert, .notice")) {
-            const text = this.cleanText(node.text).toLowerCase()
-            if (text.includes("vip")) return true
+        const root = doc.querySelector("main") ?? doc.querySelector("article") ?? doc.body
+        for (const node of root?.querySelectorAll(".photos-list, .album-photos, .lead, .alert, .notice, .vip-notice, .vip-only, .vip-required, p, h1") ?? []) {
+            if (this.imageInsideNonAlbumArea(node) || this.catalogExcluded(node)) continue
+            if (node.localName === "h1" && this.extractDetailImages(doc).length) continue
+            const text = this.cleanText(node.text)
+            if (/\bvip\s*(?:only|required|limited|exclusive)\b|\b(?:upgrade\s+to|requires?)\s+vip\b|(?:仅限|僅限|需要|升级|升級|成为|成為)[^。.!?]{0,30}\bvip\b|\bvip\b[^。.!?]{0,40}(?:限定|专享|專享|专属|專屬|才能|可见|可見|閲覧|のみ|会员[^。.!?]{0,10}(?:观看|查看)|會員[^。.!?]{0,10}(?:觀看|查看))/i.test(text)) return true
         }
         return false
     }
@@ -1675,15 +1807,12 @@ class PhotoDeckV2phSource extends ComicSource {
         const count = Number(expectedCount ?? 0)
         const pageSize = Number(firstPageImageCount ?? 0)
         const linkedMax = Math.max(1, ...this.detailPageNumbers(doc, id))
+        const lastPage = this.detailLastPage(doc, id)
+        if (lastPage) return lastPage
 
         if (count > 0 && pageSize > 0) {
-            // Main strategy is still the userscript-compatible total/page-size
-            // calculation.  However, when the real detail pager exposes 3+ pages,
-            // use it as an upper bound.  This prevents false totals or under-counted
-            // first pages from probing non-existent `/page=4` / `/4.html` URLs while
-            // keeping albums with only a "next/page 2" link from being prematurely cut.
-            let calculated = Math.ceil(count / pageSize)
-            if (linkedMax >= 3 && calculated > linkedMax) calculated = linkedMax
+            // Nearby page numbers are not a last-page signal; keep total/page-size.
+            const calculated = Math.ceil(count / pageSize)
             return Math.min(Math.max(1, calculated, count > pageSize ? 2 : 1), 500)
         }
 
@@ -1723,6 +1852,8 @@ class PhotoDeckV2phSource extends ComicSource {
     isHardDetailPageError(error) {
         const message = String(error ?? "").toLowerCase()
         return message.includes("cloudflare") ||
+            message.includes("captcha error") ||
+            message.includes("album page error") ||
             message.includes("redirect error") ||
             message.includes("http 401") ||
             message.includes("http 429") ||
@@ -1740,7 +1871,7 @@ class PhotoDeckV2phSource extends ComicSource {
             const images = pageResult.images?.length ? pageResult.images : this.extractDetailImages(pageDoc)
             const pagePhotoCount = this.countDetailPagePhotos(pageDoc)
             const pageExpected = this.extractExpectedCount(pageDoc, pagePhotoCount || images.length)
-            const vipLimited = this.looksLikeVipLimited(pageDoc)
+            const vipLimited = pageResult.vipLimited === true || this.looksLikeVipLimited(pageDoc)
             const hasPhotos = this.hasPhotosList(pageDoc) || images.length > 0
             return {
                 page,
@@ -1751,6 +1882,7 @@ class PhotoDeckV2phSource extends ComicSource {
                 pageExpected,
                 vipLimited,
                 hasPhotos,
+                lastPage: this.detailLastPage(pageDoc, id),
                 error: null
             }
         } catch (error) {
@@ -1775,10 +1907,12 @@ class PhotoDeckV2phSource extends ComicSource {
         if (this.looksLikePageNotFound(doc)) {
             throw "V2PH detailUrlInvalid: opened page is Page not found."
         }
-        if (this.looksLikeLoginRequired(doc)) {
+        const images = this.extractDetailImages(doc)
+        const vipLimited = !images.length && this.looksLikeVipLimited(doc)
+        if (!vipLimited && this.looksLikeLoginRequired(doc)) {
             throw "V2PH login is required. Use Login with webview from this source account settings."
         }
-        if (!this.hasPhotosList(doc)) {
+        if (!vipLimited && !this.hasPhotosList(doc)) {
             throw "No V2PH photos-list found. The page may still be behind Cloudflare/login, or the detail DOM changed."
         }
         const normalizedId = this.normalizeAlbumId(id)
@@ -1791,17 +1925,16 @@ class PhotoDeckV2phSource extends ComicSource {
         const vendors = this.uniqueValues([...meta.vendors, ...this.linkValuesByPath(root, ["/company/", "company/", "/vendor", "vendor/"], "Vendor")])
         const models = this.uniqueValues([...meta.models, ...this.linkValuesByPath(root, ["/actor/", "actor/", "/model", "model/"], "Model")])
         const tags = this.uniqueValues([...meta.tags, ...this.linkValuesByPath(root, ["/category/", "category/", "/tag", "tag/"], "Tags")])
-        const images = this.extractDetailImages(doc)
         const pageImageCount = this.countDetailPagePhotos(doc) || images.length
-        const expectedCount = meta.imageCount || this.extractExpectedCount(doc, pageImageCount) || images.length
+        const expectedCount = this.extractExpectedCount(doc, pageImageCount) || images.length
         const related = this.parseRelatedComics(doc, normalizedId)
-        if (!images.length) {
+        if (!images.length && !vipLimited) {
             throw "No V2PH images found. The page may still be behind Cloudflare/login, or the detail DOM changed."
         }
         return {
             title,
             subtitle: models.join(", ") || vendors.join(", "),
-            cover: images[0],
+            cover: images[0] || this.imageUrl(doc.querySelector("meta[property='og:image']")?.attributes?.content) || "https://www.v2ph.com/img/favicon.svg",
             description: this.absoluteUrl(this.detailPath(normalizedId, 1, this.albumUrlStyle[normalizedId] || "html")),
             tags: {
                 "Vendor": vendors,
@@ -1810,7 +1943,7 @@ class PhotoDeckV2phSource extends ComicSource {
                 "Source": ["V2PH"]
             },
             chapters: {
-                "main": "Photos"
+                "main": vipLimited ? "VIP 限制（无公开图片）" : "Photos"
             },
             thumbnails: images,
             recommend: related,
@@ -1820,6 +1953,7 @@ class PhotoDeckV2phSource extends ComicSource {
             url: this.absoluteUrl(this.detailPath(normalizedId, 1, this.albumUrlStyle[normalizedId] || "html")),
             maxPage: expectedCount,
             _expectedCount: expectedCount,
+            _vipLimited: vipLimited,
             stars: null
         }
     }
@@ -1957,8 +2091,9 @@ class PhotoDeckV2phSource extends ComicSource {
                 const allImages = [...detail.thumbnails]
                 const firstPageDomPhotoCount = this.countDetailPagePhotos(doc)
                 let firstPageImageCount = this.effectiveFirstPagePhotoCount(firstPageDomPhotoCount, allImages.length, 0)
-                let expectedCount = Number(this.extractExpectedCount(doc, firstPageImageCount) ?? detail._expectedCount ?? detail.maxPage ?? 0)
+                let expectedCount = Number(this.extractExpectedCount(doc, firstPageImageCount) ?? 0)
                 const lockedExpectedCount = expectedCount > 0
+                let lastPage = this.detailLastPage(doc, normalizedId)
                 firstPageImageCount = this.effectiveFirstPagePhotoCount(firstPageDomPhotoCount, allImages.length, expectedCount)
                 let fetchLimit = this.detailFetchLimit(doc, normalizedId, expectedCount, firstPageImageCount)
 
@@ -1973,36 +2108,43 @@ class PhotoDeckV2phSource extends ComicSource {
                 // Only do the extra 3-page probe when the total count is missing or
                 // unreliable. If a 13P/15P total is already known, probing page 3 is
                 // exactly what can pull unrelated images after page 2.
-                if (forceProbeShortAlbum && (!expectedCount || expectedCount <= allImages.length)) fetchLimit = Math.max(fetchLimit, 3)
+                if (!lastPage && forceProbeShortAlbum && (!expectedCount || expectedCount <= allImages.length)) fetchLimit = Math.max(fetchLimit, 3)
                 let duplicatePages = 0
                 let nextPage = 2
-                let stopPaging = false
+                let tailSkipped = false
+                let vipLimited = detail._vipLimited === true
+                const canSkipTail = () => expectedCount > allImages.length && expectedCount - allImages.length <= 10 && allImages.length >= expectedCount / 2
 
                 // Long albums were slow because pages were fetched strictly one by one,
                 // with retry + delay on every page.  Fetch follow-up detail pages in
                 // small batches: conservative enough for V2PH, but much faster for 80P+ albums.
-                while (nextPage <= fetchLimit && !stopPaging) {
-                    if (expectedCount > 0 && allImages.length >= expectedCount) break
+                while (!vipLimited && nextPage <= fetchLimit) {
+                    if (expectedCount > 0 && allImages.length >= expectedCount && (!lastPage || nextPage > lastPage)) break
 
                     const concurrency = this.detailFetchConcurrency(fetchLimit)
                     const batchPages = []
                     while (batchPages.length < concurrency && nextPage <= fetchLimit) {
-                        if (expectedCount > 0 && allImages.length >= expectedCount) break
                         batchPages.push(nextPage)
                         nextPage += 1
                     }
                     if (!batchPages.length) break
 
                     const knownSnapshot = allImages.slice()
-                    const batchResults = await Promise.all(batchPages.map((page) => this.fetchDetailPageImages(normalizedId, page, firstUrl, albumStyle, knownSnapshot)))
+                    const batchResults = await Promise.all(batchPages.map((page) => this.fetchDetailPageImages(normalizedId, page, firstUrl, albumStyle, knownSnapshot)
+                        .catch((error) => ({ page, error: String(error), rawError: error }))))
                     batchResults.sort((left, right) => left.page - right.page)
 
                     let batchNewImages = 0
                     for (const result of batchResults) {
-                        if (result.vipLimited) {
-                            UI.showMessage(`V2PH VIP-limited album: loaded ${allImages.length}${expectedCount ? "/" + expectedCount : ""}.`)
-                            stopPaging = true
-                            break
+                        if (lastPage && result.page > lastPage && (!result.error || /HTTP 404|Page not found/i.test(result.error))) continue
+                        if (result.error) {
+                            if (canSkipTail()) { tailSkipped = true; break }
+                            if (result.rawError) throw result.rawError
+                            throw `V2PH Album page error：网页第 ${result.page} 页请求失败，已取得 ${allImages.length}${expectedCount ? "/" + expectedCount : ""} 张；未保存残缺阅读缓存。请检查网络后重新打开。`
+                        }
+                        if (result.lastPage) {
+                            lastPage = result.lastPage
+                            fetchLimit = lastPage
                         }
 
                         if (result.style) albumStyle = result.style
@@ -2017,6 +2159,11 @@ class PhotoDeckV2phSource extends ComicSource {
                         }
                         const added = allImages.length - beforeCount
                         batchNewImages += added
+                        if (result.vipLimited) { vipLimited = true; break }
+                        if (added === 0 && ((expectedCount > allImages.length && !lastPage) || (lastPage && result.page < lastPage))) {
+                            if (canSkipTail()) { tailSkipped = true; break }
+                            throw `V2PH Album page error：网页第 ${result.page} 页没有新增图片，已取得 ${allImages.length}${expectedCount ? "/" + expectedCount : ""} 张，尚未到确认的末页；未保存残缺阅读缓存。`
+                        }
 
                         const recalculatedLimit = this.detailFetchLimit(doc, normalizedId, expectedCount, firstPageImageCount || result.pagePhotoCount || result.images?.length || 1)
                         if (recalculatedLimit > fetchLimit) fetchLimit = recalculatedLimit
@@ -2028,7 +2175,8 @@ class PhotoDeckV2phSource extends ComicSource {
                         }
                     }
 
-                    if (expectedCount > 0 && allImages.length >= expectedCount) break
+                    if (tailSkipped || vipLimited) break
+                    if (expectedCount > 0 && allImages.length >= expectedCount && (!lastPage || nextPage > lastPage)) break
                     if (batchNewImages === 0) {
                         if (expectedCount > 0 && allImages.length < expectedCount) {
                             UI.showMessage(`V2PH had no new images in pages ${batchPages[0]}-${batchPages[batchPages.length - 1]}; loaded ${allImages.length}/${expectedCount}.`)
@@ -2041,7 +2189,27 @@ class PhotoDeckV2phSource extends ComicSource {
                 let finalImages = allImages
                     .map((image) => this.imageUrl(image) || String(image ?? ""))
                     .filter((image, index, list) => image && /^https?:\/\//i.test(image) && list.indexOf(image) === index)
-                if (expectedCount > 0 && finalImages.length > expectedCount) finalImages = finalImages.slice(0, expectedCount)
+                const reachedLastPage = lastPage > 0 && nextPage > lastPage
+                if (!expectedCount && !reachedLastPage && !vipLimited) {
+                    throw `V2PH Album page error：取得 ${finalImages.length} 张，但缺少可靠总数或末页信息，无法确认完整；未保存残缺阅读缓存。`
+                }
+                if (!vipLimited && canSkipTail()) tailSkipped = true
+                if (expectedCount > finalImages.length && !reachedLastPage && !tailSkipped && !vipLimited) {
+                    throw `V2PH Album page error：仅取得 ${finalImages.length}/${expectedCount} 张，未确认正常末页；未保存残缺阅读缓存。请检查节点后重新打开。`
+                }
+                const previousDetail = this.detailCache[normalizedId] ?? this.detailCache[id]
+                const previousImages = this.readerImageCache[normalizedId] ?? this.readerImageCache[id]
+                if (vipLimited && (previousDetail?._readable === true || previousDetail?._completed === true) && previousImages?.length > finalImages.length) {
+                    UI.showMessage(`本次遇到 VIP 限制，继续使用原有 ${previousImages.length} 张阅读缓存。`)
+                    return previousDetail
+                }
+                if (expectedCount > finalImages.length && previousDetail?._completed === true && previousImages?.length > finalImages.length) {
+                    if (tailSkipped) {
+                        UI.showMessage(`本次尾部不完整，继续使用原有 ${previousImages.length} 张完整缓存。`)
+                        return previousDetail
+                    }
+                    throw `V2PH Album page error：本次取得 ${finalImages.length}/${expectedCount} 张，少于原有 ${previousImages.length} 张；已保留原完整缓存，请检查后再刷新。`
+                }
 
                 // Venera's client currently fixes the detail-page order as
                 // Preview -> Related. A comic source cannot reorder those widgets.
@@ -2052,7 +2220,10 @@ class PhotoDeckV2phSource extends ComicSource {
                 this.readerImageCache[id] = finalImages
                 detail.thumbnails = null
                 detail._expectedCount = expectedCount || finalImages.length
-                detail._completed = !expectedCount || finalImages.length >= expectedCount
+                detail._completed = !vipLimited && !tailSkipped && (!expectedCount || finalImages.length >= expectedCount || reachedLastPage)
+                detail._readable = finalImages.length > 0
+                detail._partialTail = tailSkipped
+                detail._vipLimited = vipLimited
                 detail.maxPage = finalImages.length
                 detail.cover = finalImages[0] || detail.cover || "https://www.v2ph.com/img/favicon.svg"
                 detail.title = String(detail.title || normalizedId)
@@ -2062,8 +2233,14 @@ class PhotoDeckV2phSource extends ComicSource {
                 detail.updateTime = String(detail.updateTime || "")
                 detail.uploader = String(detail.uploader || "V2PH")
                 detail.url = String(detail.url || firstUrl || this.absoluteUrl(this.detailPath(normalizedId, 1, albumStyle)))
-                if (expectedCount > 0 && finalImages.length < expectedCount) {
-                    UI.showMessage(`V2PH images incomplete: loaded ${finalImages.length}/${expectedCount}. Tried .html, bare and /page.html detail pagination.`)
+                if (vipLimited) {
+                    const note = finalImages.length ? `V2PH VIP 限制：已保留 ${finalImages.length}${expectedCount ? "/" + expectedCount : ""} 张公开图片，可直接阅读；其余图片需要相应权限。` : "V2PH VIP 限制：当前账号没有可阅读的公开图片，需要相应 VIP 权限。获得权限后请刷新详情，不必重新导入源。"
+                    UI.showMessage(note)
+                    detail.description += "\n" + note
+                } else if (expectedCount > 0 && finalImages.length < expectedCount) {
+                    const note = tailSkipped ? `V2PH 已取得 ${finalImages.length}/${expectedCount} 张，尾部少量图片未取得，已允许阅读。` : `V2PH 已读到明确末页，取得 ${finalImages.length} 张，网站声明 ${expectedCount} 张；数量存在差异，未补造图片。`
+                    UI.showMessage(note)
+                    detail.description += "\n" + note
                 }
                 this.detailCache[normalizedId] = detail
                 this.detailCache[id] = detail
@@ -2078,11 +2255,17 @@ class PhotoDeckV2phSource extends ComicSource {
             const cachedImages = this.readerImageCache[normalizedId] ??
                 this.readerImageCache[id] ??
                 cachedDetail?.thumbnails
-            if (cachedImages?.length) {
+            if (cachedDetail?._vipLimited === true && !cachedImages?.length) {
+                throw "V2PH VIP 限制：当前账号没有可阅读的公开图片。获得相应权限后请刷新详情。"
+            }
+            if (cachedImages?.length && (cachedDetail?._completed === true || cachedDetail?._readable === true)) {
                 return { images: cachedImages.filter((image) => image && /^https?:\/\//i.test(String(image))) }
             }
             await this.comic.loadInfo(normalizedId)
             const loadedImages = this.readerImageCache[normalizedId] ?? this.readerImageCache[id] ?? []
+            if (this.detailCache[normalizedId]?._vipLimited === true && !loadedImages.length) {
+                throw "V2PH VIP 限制：当前账号没有可阅读的公开图片。获得相应权限后请刷新详情。"
+            }
             return { images: loadedImages.filter((image) => image && /^https?:\/\//i.test(String(image))) }
         },
         onImageLoad: async (imageKey, id, ep) => {
