@@ -3,7 +3,8 @@ class PhotoDeckV2phSource extends ComicSource {
 
     key = "photo_deck_v2ph"
 
-    version = "0.3.41"
+    // 0.3.46: serial page pacing includes request/parse time; page 2 keeps its 1 s wait.
+    version = "0.3.46"
 
     minAppVersion = "1.17.0"
 
@@ -29,6 +30,24 @@ class PhotoDeckV2phSource extends ComicSource {
 
     detailCache = {}
 
+    // Per-album partial result for mobile-safe resume: images fetched so far +
+    // the first page that still needs fetching. Only kept in memory.
+    partialCache = {}
+
+    // 0.3.42 test switch. false = let the client reuse pages (the change under
+    // test). If a cached Cloudflare page is ever observed, set this to true and
+    // re-import; that restores the old cache-time: no behavior.
+    bypassAlbumCache = false
+
+    // Short-lived cache for list/category/actor/search pages. Avoids a new
+    // Cloudflare-checked request when the user goes back to the same page.
+    listCache = {}
+
+    // Last page the user actually opened. Used as Referer for the next
+    // list/category request so navigation looks like a browser click, not a
+    // cold direct hit from the home page.
+    lastPageUrl = ""
+
     // Full reader images are kept separately from ComicDetails.thumbnails.
     // Venera renders thumbnails before recommendations in a fixed UI order;
     // keeping this field separate lets the source hide the long Preview block
@@ -46,6 +65,8 @@ class PhotoDeckV2phSource extends ComicSource {
     captchaTask = null
     captchaPaused = false
     captchaPauseUntil = 0
+    rateLimitUntil = 0
+    lastAlbumRequestAt = 0
 
     tagLinkMap = {}
 
@@ -865,8 +886,9 @@ class PhotoDeckV2phSource extends ComicSource {
             ...this.headers,
             "Referer": referer || this.siteUrl
         }
-        // Do not reuse a cached restriction page after the user fixes connectivity.
-        if (/\/album\//i.test(String(url))) headers["cache-time"] = "no"
+        if (this.bypassAlbumCache && /\/album\//i.test(String(url))) {
+            headers["cache-time"] = "no"
+        }
         return headers
     }
 
@@ -889,6 +911,10 @@ class PhotoDeckV2phSource extends ComicSource {
     // Preserve its native verification marker instead of parsing an empty body.
     checkResponseError(response, target) {
         if (/CloudflareException:\s*/.test(String(response?.error ?? "")) || this.isCloudflareChallenge(response)) {
+            // 0.3.42: if this challenge came from a cached page, the next attempt
+            // must bypass the client cache; otherwise the same challenge HTML can
+            // be replayed even after the user solves it.
+            this.bypassAlbumCache = true
             throw `CloudflareException: ${target}`
         }
         if (response?.error) throw "V2PH 网络请求失败；请检查网络后重试。未清除登录记录。"
@@ -905,6 +931,7 @@ class PhotoDeckV2phSource extends ComicSource {
         const headers = this.requestHeaders(target, referer)
         let response
         try {
+            if (/\/album\//i.test(String(target))) this.lastAlbumRequestAt = Date.now()
             response = await Network.get(target, headers)
             this.checkResponseError(response, target)
             return response
@@ -915,6 +942,7 @@ class PhotoDeckV2phSource extends ComicSource {
         // Only a redirect failure qualifies. No cookie deletion, domain switch,
         // persistent engine switch, or unbounded retry; the native jar stays in use.
         try {
+            if (/\/album\//i.test(String(target))) this.lastAlbumRequestAt = Date.now()
             const fallback = await Network.get(target, {...headers, http_client: "dart:io"})
             if (this.isRedirectError(fallback?.error)) {
                 throw "V2PH Redirect error：默认与备用通道均无法完成跳转。请在 WebView 检查原站是否要求登录；未清除 Cookie，不会继续重试。"
@@ -1002,11 +1030,16 @@ class PhotoDeckV2phSource extends ComicSource {
                     const boundary = "----VeneraV2ph" + Date.now()
                     const fields = { captcha_id: captchaId, captcha_code: String(code).trim(), submit: "提交" }
                     const data = Object.keys(fields).map((name) => `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${fields[name]}\r\n`).join("") + `--${boundary}--\r\n`
+                    this.lastAlbumRequestAt = Date.now()
                     const response = await Network.post(target, {
                         ...this.requestHeaders(target, target),
                         "Content-Type": "multipart/form-data; boundary=" + boundary
                     }, data, { maskHeadersInLog: ["cookie"], maskDataInLog: true })
                     this.checkResponseError(response, target)
+                    if (response.status === 429) {
+                        this.rateLimitUntil = Date.now() + 15000
+                        throw "V2PH HTTP 429：提交验证码时请求过快，已暂停 15 秒；请稍后再试。"
+                    }
                     if (response.status >= 400) throw "V2PH Captcha error：网站未接受验证提交，请检查网络后再手动验证。"
                     const result = new HtmlDocument(String(response.body ?? ""))
                     try {
@@ -1014,12 +1047,18 @@ class PhotoDeckV2phSource extends ComicSource {
                             const choice = await UI.showSelectDialog("验证码未通过，是否换一张？", ["换一张，重新填写", "取消"], 0)
                             if (choice !== 0) throw "V2PH Captcha error：验证已取消；稍候点击当前页面重试。"
                             const refreshed = await this.getSiteResponse(target, target)
+                            if (refreshed.status === 429) {
+                                this.rateLimitUntil = Date.now() + 15000
+                                throw "V2PH HTTP 429：换图请求过快，已暂停 15 秒；请稍后再试。"
+                            }
                             if (refreshed.status >= 400) throw `V2PH Captcha error：换图请求失败，HTTP ${refreshed.status}。`
                             refreshDoc?.dispose()
                             refreshDoc = new HtmlDocument(String(refreshed.body ?? ""))
                             captchaForm = refreshDoc.querySelector("form#album-captcha-form")
                             if (!captchaForm?.querySelector("input[name='captcha_code']")) {
-                                if (this.documentBelongsToAlbum(refreshDoc, this.extractAlbumId(target)) && (this.extractDetailImages(refreshDoc).length || this.looksLikeVipLimited(refreshDoc))) return
+                                if (this.documentBelongsToAlbum(refreshDoc, this.extractAlbumId(target)) && (this.extractDetailImages(refreshDoc).length || this.looksLikeVipLimited(refreshDoc))) {
+                                    return String(refreshed.body ?? "")
+                                }
                                 throw "V2PH Captcha error：未取得新的验证码，请稍候在当前页重试。"
                             }
                             prompt = "V2PH：已换新图，请重新输入验证码"
@@ -1028,7 +1067,10 @@ class PhotoDeckV2phSource extends ComicSource {
                         if (!this.documentBelongsToAlbum(result, this.extractAlbumId(target)) || (!this.extractDetailImages(result).length && !this.looksLikeVipLimited(result))) {
                             throw "V2PH Captcha error：网站未返回图集，请稍候在当前页重试。"
                         }
-                        return
+                        // Reuse this successful POST response instead of GETting
+                        // the same URL again; the refetch often returns another
+                        // captcha and makes a correct submission look failed.
+                        return String(response.body ?? "")
                     } finally {
                         result.dispose()
                     }
@@ -1051,6 +1093,9 @@ class PhotoDeckV2phSource extends ComicSource {
 
     async getDocument(path, referer = this.siteUrl, captchaRetried = false) {
         const target = this.absoluteUrl(this.localizedPath(path))
+        if (this.rateLimitUntil && Date.now() < this.rateLimitUntil && /\/album\//i.test(target)) {
+            throw `V2PH HTTP 429 冷却中：请等待 ${Math.ceil((this.rateLimitUntil - Date.now()) / 1000)} 秒后再重试；已保留已取得的图片。`
+        }
         if (this.captchaPaused && /\/album\//i.test(target)) {
             if (Date.now() < this.captchaPauseUntil) throw "V2PH Captcha error：验证码待完成，稍候点击当前页面重试即可换图填写。"
             this.captchaPaused = false
@@ -1058,6 +1103,10 @@ class PhotoDeckV2phSource extends ComicSource {
         const response = await this.getSiteResponse(target, referer)
         if (response.status === 403) {
             throw "V2PH HTTP 403：站点拒绝访问，不能确定是登录过期。未清除 Cookie；请检查原站是否要求验证。"
+        }
+        if (response.status === 429) {
+            this.rateLimitUntil = Date.now() + 15000
+            throw `V2PH HTTP 429：请求过快，已暂停 15 秒；请稍后再试，已保留已取得的图片。`
         }
         if (response.status >= 400) {
             throw `V2PH HTTP ${response.status}: ${target}`
@@ -1082,10 +1131,22 @@ class PhotoDeckV2phSource extends ComicSource {
                 doc.dispose()
                 throw "V2PH Captcha error：提交后网站仍要求验证码，已停止；稍候点击当前页面重试。"
             }
+            let captchaBody = ""
             try {
-                await this.completeAlbumCaptcha(captcha, target)
+                captchaBody = await this.completeAlbumCaptcha(captcha, target)
             } finally {
                 doc.dispose()
+            }
+            if (typeof captchaBody === "string" && captchaBody) {
+                this.lastRawBody = captchaBody
+                this.lastSourceUrl = target
+                this.rawBodyCache[target] = captchaBody
+                const resolved = new HtmlDocument(captchaBody)
+                if (this.looksLikeQuotaExceeded(resolved)) {
+                    resolved.dispose()
+                    throw "V2PH account quota appears to be exceeded for today."
+                }
+                return resolved
             }
             return this.getDocument(target, referer, true)
         }
@@ -1842,11 +1903,14 @@ class PhotoDeckV2phSource extends ComicSource {
     }
 
     detailFetchConcurrency(fetchLimit) {
-        const limit = Number(fetchLimit ?? 1)
-        if (limit >= 80) return 5
-        if (limit >= 30) return 4
-        if (limit >= 8) return 3
-        return 2
+        // 0.3.42 mobile test: never fire follow-up detail pages in parallel.
+        // The phone log showed page 2 and page 3 leaving 1.9 ms apart, and
+        // Cloudflare challenged one of the pair every round.
+        return 1
+    }
+
+    isCloudflareError(error) {
+        return /cloudflare/i.test(String(error ?? ""))
     }
 
     isHardDetailPageError(error) {
@@ -1958,9 +2022,20 @@ class PhotoDeckV2phSource extends ComicSource {
         }
     }
 
-    async loadAlbumPage(path, page) {
+    async loadAlbumPage(path, page, referer = "") {
         const currentPage = this.normalizePage(page, 1)
-        const doc = await this.getDocument(path)
+        const cacheKey = `${path}#${currentPage}`
+        const cached = this.listCache[cacheKey]
+        if (cached && Date.now() - cached.at < 2 * 60 * 1000) {
+            this.lastPageUrl = cached.url
+            return { comics: cached.comics, maxPage: cached.maxPage }
+        }
+
+        // Use the page the user just left as Referer. A tag/category click from
+        // an album therefore looks like normal navigation instead of a cold
+        // direct request with Referer: home.
+        const actualReferer = referer || this.lastPageUrl || this.siteUrl
+        const doc = await this.getDocument(path, actualReferer)
         try {
             const comics = this.parseAlbumList(doc)
             const parsedMaxPage = this.extractMaxPage(doc, currentPage)
@@ -1970,10 +2045,16 @@ class PhotoDeckV2phSource extends ComicSource {
             // maxPage so the first page immediately exposes the real jump range.
             const countBasedMaxPage = totalCount ? Math.ceil(totalCount / 16) : null
             const fallbackMaxPage = comics.length ? currentPage : 1
-            return {
-                comics,
-                maxPage: Math.max(currentPage, parsedMaxPage ?? 0, countBasedMaxPage ?? 0, fallbackMaxPage)
+            const maxPage = Math.max(currentPage, parsedMaxPage ?? 0, countBasedMaxPage ?? 0, fallbackMaxPage)
+            const url = this.absoluteUrl(this.localizedPath(path))
+            this.lastPageUrl = url
+            this.listCache[cacheKey] = { comics, maxPage, at: Date.now(), url }
+            const cacheKeys = Object.keys(this.listCache)
+            if (cacheKeys.length > 40) {
+                cacheKeys.sort((left, right) => this.listCache[left].at - this.listCache[right].at)
+                for (const key of cacheKeys.slice(0, cacheKeys.length - 40)) delete this.listCache[key]
             }
+            return { comics, maxPage }
         } finally {
             doc.dispose()
         }
@@ -2081,14 +2162,21 @@ class PhotoDeckV2phSource extends ComicSource {
         idMatch: "^(?:https?://[^/]+)?/?album/[^/?#]+(?:/\\d+)?(?:\\.html)?(?:\\?page=\\d+)?$|^[A-Za-z0-9_-]+$",
         loadInfo: async (id) => {
             const normalizedId = this.normalizeAlbumId(id)
-            const firstResult = await this.getAlbumDocumentWithFallback(normalizedId, 1, this.siteUrl, this.albumUrlStyle[normalizedId])
+            // If the user clicked this album from a list/category/actor/search
+            // page, use that page as Referer. Opening from history/another album
+            // falls back to the site root, which is the old behavior.
+            const detailReferer = this.lastPageUrl && !/\/album\//i.test(this.lastPageUrl)
+                ? this.lastPageUrl
+                : this.siteUrl
+            const firstResult = await this.getAlbumDocumentWithFallback(normalizedId, 1, detailReferer, this.albumUrlStyle[normalizedId])
             const doc = firstResult.doc
             let firstUrl = firstResult.url
             let albumStyle = firstResult.style
+            this.lastPageUrl = firstUrl
             try {
                 const detail = this.parseDetail(doc, normalizedId)
                 detail.url = firstUrl
-                const allImages = [...detail.thumbnails]
+                let allImages = [...detail.thumbnails]
                 const firstPageDomPhotoCount = this.countDetailPagePhotos(doc)
                 let firstPageImageCount = this.effectiveFirstPagePhotoCount(firstPageDomPhotoCount, allImages.length, 0)
                 let expectedCount = Number(this.extractExpectedCount(doc, firstPageImageCount) ?? 0)
@@ -2112,12 +2200,22 @@ class PhotoDeckV2phSource extends ComicSource {
                 let duplicatePages = 0
                 let nextPage = 2
                 let tailSkipped = false
+                let partialStopped = false
+                let partialPage = 0
                 let vipLimited = detail._vipLimited === true
-                const canSkipTail = () => expectedCount > allImages.length && expectedCount - allImages.length <= 10 && allImages.length >= expectedCount / 2
 
-                // Long albums were slow because pages were fetched strictly one by one,
-                // with retry + delay on every page.  Fetch follow-up detail pages in
-                // small batches: conservative enough for V2PH, but much faster for 80P+ albums.
+                // A previous attempt may have been stopped by Cloudflare on page N.
+                // Reuse its images and start from that page instead of refetching
+                // pages 1..N-1 and re-triggering the challenge.
+                const partial = this.partialCache[normalizedId]
+                if (partial && Date.now() - partial.at < 10 * 60 * 1000) {
+                    allImages = partial.images.slice()
+                    nextPage = partial.nextPage
+                }
+                const canSkipTail = () => expectedCount > allImages.length && expectedCount - allImages.length <= 10 && allImages.length >= expectedCount / 2
+                let lastDetailRequestAt = null
+
+                // Keep serial fetching; count request/parse time toward the next interval.
                 while (!vipLimited && nextPage <= fetchLimit) {
                     if (expectedCount > 0 && allImages.length >= expectedCount && (!lastPage || nextPage > lastPage)) break
 
@@ -2129,7 +2227,15 @@ class PhotoDeckV2phSource extends ComicSource {
                     }
                     if (!batchPages.length) break
 
+                    const intervalMs = batchPages[0] === 2 ? 1000 : 1200 + Math.floor(Math.random() * 400)
+                    // Preserve the first wait on fresh/resumed loads. Use the latest HTTP
+                    // start after a captcha or URL fallback, not time spent filling a form.
+                    const waitMs = lastDetailRequestAt === null ? intervalMs : Math.max(0,
+                        intervalMs - (Date.now() - Math.max(lastDetailRequestAt, this.lastAlbumRequestAt)))
+                    if (waitMs > 0) await this.sleep(waitMs)
+
                     const knownSnapshot = allImages.slice()
+                    lastDetailRequestAt = Date.now()
                     const batchResults = await Promise.all(batchPages.map((page) => this.fetchDetailPageImages(normalizedId, page, firstUrl, albumStyle, knownSnapshot)
                         .catch((error) => ({ page, error: String(error), rawError: error }))))
                     batchResults.sort((left, right) => left.page - right.page)
@@ -2139,6 +2245,15 @@ class PhotoDeckV2phSource extends ComicSource {
                         if (lastPage && result.page > lastPage && (!result.error || /HTTP 404|Page not found/i.test(result.error))) continue
                         if (result.error) {
                             if (canSkipTail()) { tailSkipped = true; break }
+                            // 0.3.42: a Cloudflare challenge on a follow-up page
+                            // must not throw away pages already fetched or force the
+                            // client to reload the whole album. Keep a partial result
+                            // and resume from this page on the next open.
+                            if (this.isCloudflareError(result.rawError ?? result.error) && allImages.length) {
+                                partialStopped = true
+                                partialPage = result.page
+                                break
+                            }
                             if (result.rawError) throw result.rawError
                             throw `V2PH Album page error：网页第 ${result.page} 页请求失败，已取得 ${allImages.length}${expectedCount ? "/" + expectedCount : ""} 张；未保存残缺阅读缓存。请检查网络后重新打开。`
                         }
@@ -2175,7 +2290,7 @@ class PhotoDeckV2phSource extends ComicSource {
                         }
                     }
 
-                    if (tailSkipped || vipLimited) break
+                    if (partialStopped || tailSkipped || vipLimited) break
                     if (expectedCount > 0 && allImages.length >= expectedCount && (!lastPage || nextPage > lastPage)) break
                     if (batchNewImages === 0) {
                         if (expectedCount > 0 && allImages.length < expectedCount) {
@@ -2190,17 +2305,22 @@ class PhotoDeckV2phSource extends ComicSource {
                     .map((image) => this.imageUrl(image) || String(image ?? ""))
                     .filter((image, index, list) => image && /^https?:\/\//i.test(image) && list.indexOf(image) === index)
                 const reachedLastPage = lastPage > 0 && nextPage > lastPage
-                if (!expectedCount && !reachedLastPage && !vipLimited) {
+                if (!partialStopped && !expectedCount && !reachedLastPage && !vipLimited) {
                     throw `V2PH Album page error：取得 ${finalImages.length} 张，但缺少可靠总数或末页信息，无法确认完整；未保存残缺阅读缓存。`
                 }
                 if (!vipLimited && canSkipTail()) tailSkipped = true
-                if (expectedCount > finalImages.length && !reachedLastPage && !tailSkipped && !vipLimited) {
+                if (!partialStopped && expectedCount > finalImages.length && !reachedLastPage && !tailSkipped && !vipLimited) {
                     throw `V2PH Album page error：仅取得 ${finalImages.length}/${expectedCount} 张，未确认正常末页；未保存残缺阅读缓存。请检查节点后重新打开。`
                 }
                 const previousDetail = this.detailCache[normalizedId] ?? this.detailCache[id]
                 const previousImages = this.readerImageCache[normalizedId] ?? this.readerImageCache[id]
                 if (vipLimited && (previousDetail?._readable === true || previousDetail?._completed === true) && previousImages?.length > finalImages.length) {
                     UI.showMessage(`本次遇到 VIP 限制，继续使用原有 ${previousImages.length} 张阅读缓存。`)
+                    return previousDetail
+                }
+                if (partialStopped && previousDetail?._completed === true && previousImages?.length > finalImages.length) {
+                    delete this.partialCache[normalizedId]
+                    UI.showMessage(`本次第 ${partialPage} 页被 Cloudflare 拦截，继续使用原有 ${previousImages.length} 张完整缓存。`)
                     return previousDetail
                 }
                 if (expectedCount > finalImages.length && previousDetail?._completed === true && previousImages?.length > finalImages.length) {
@@ -2220,7 +2340,8 @@ class PhotoDeckV2phSource extends ComicSource {
                 this.readerImageCache[id] = finalImages
                 detail.thumbnails = null
                 detail._expectedCount = expectedCount || finalImages.length
-                detail._completed = !vipLimited && !tailSkipped && (!expectedCount || finalImages.length >= expectedCount || reachedLastPage)
+                detail._completed = !vipLimited && !tailSkipped && !partialStopped &&
+                    (!expectedCount || finalImages.length >= expectedCount || reachedLastPage)
                 detail._readable = finalImages.length > 0
                 detail._partialTail = tailSkipped
                 detail._vipLimited = vipLimited
@@ -2237,10 +2358,22 @@ class PhotoDeckV2phSource extends ComicSource {
                     const note = finalImages.length ? `V2PH VIP 限制：已保留 ${finalImages.length}${expectedCount ? "/" + expectedCount : ""} 张公开图片，可直接阅读；其余图片需要相应权限。` : "V2PH VIP 限制：当前账号没有可阅读的公开图片，需要相应 VIP 权限。获得权限后请刷新详情，不必重新导入源。"
                     UI.showMessage(note)
                     detail.description += "\n" + note
-                } else if (expectedCount > 0 && finalImages.length < expectedCount) {
+                } else if (!partialStopped && expectedCount > 0 && finalImages.length < expectedCount) {
                     const note = tailSkipped ? `V2PH 已取得 ${finalImages.length}/${expectedCount} 张，尾部少量图片未取得，已允许阅读。` : `V2PH 已读到明确末页，取得 ${finalImages.length} 张，网站声明 ${expectedCount} 张；数量存在差异，未补造图片。`
                     UI.showMessage(note)
                     detail.description += "\n" + note
+                }
+                if (partialStopped) {
+                    this.partialCache[normalizedId] = {
+                        images: allImages.slice(),
+                        nextPage: partialPage,
+                        at: Date.now()
+                    }
+                    const note = `V2PH 第 ${partialPage} 页被 Cloudflare 验证拦截；已保留 ${finalImages.length}${expectedCount ? "/" + expectedCount : ""} 张，可先阅读；稍后重新打开会从该页继续。`
+                    UI.showMessage(note)
+                    detail.description += "\n" + note
+                } else {
+                    delete this.partialCache[normalizedId]
                 }
                 this.detailCache[normalizedId] = detail
                 this.detailCache[id] = detail

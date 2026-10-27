@@ -37,7 +37,7 @@
   {
     "name": "V2PH",
     "key": "photo_deck_v2ph",
-    "version": "0.3.41",
+    "version": "0.3.46",
     "fileName": "scripts/v2ph.js",
     "description": "保留现用阅读实现；新增目录缓存与手动刷新，登录环境实测待确认"
   },
