@@ -4,7 +4,7 @@ class PhotoDeckV2phSource extends ComicSource {
     key = "photo_deck_v2ph"
 
     // 0.3.46: serial page pacing includes request/parse time; page 2 keeps its 1 s wait.
-    version = "0.3.47"
+    version = "0.3.48"
 
     minAppVersion = "1.17.0"
 
@@ -2228,7 +2228,7 @@ class PhotoDeckV2phSource extends ComicSource {
                     }
                     if (!batchPages.length) break
 
-                    const intervalMs = batchPages[0] === 2 ? 1000 : 1200 + Math.floor(Math.random() * 400)
+                    const intervalMs = batchPages[0] === 2 ? 1000 : 800 + Math.floor(Math.random() * 201)
                     // Preserve the first wait on fresh/resumed loads. Use the latest HTTP
                     // start after a captcha or URL fallback, not time spent filling a form.
                     const waitMs = lastDetailRequestAt === null ? intervalMs : Math.max(0,
