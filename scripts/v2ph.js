@@ -4,7 +4,7 @@ class PhotoDeckV2phSource extends ComicSource {
     key = "photo_deck_v2ph"
 
     // 0.3.46: serial page pacing includes request/parse time; page 2 keeps its 1 s wait.
-    version = "0.3.46"
+    version = "0.3.47"
 
     minAppVersion = "1.17.0"
 
@@ -2200,6 +2200,7 @@ class PhotoDeckV2phSource extends ComicSource {
                 let duplicatePages = 0
                 let nextPage = 2
                 let tailSkipped = false
+                let unavailablePage = 0
                 let partialStopped = false
                 let partialPage = 0
                 let vipLimited = detail._vipLimited === true
@@ -2244,7 +2245,6 @@ class PhotoDeckV2phSource extends ComicSource {
                     for (const result of batchResults) {
                         if (lastPage && result.page > lastPage && (!result.error || /HTTP 404|Page not found/i.test(result.error))) continue
                         if (result.error) {
-                            if (canSkipTail()) { tailSkipped = true; break }
                             // 0.3.42: a Cloudflare challenge on a follow-up page
                             // must not throw away pages already fetched or force the
                             // client to reload the whole album. Keep a partial result
@@ -2254,6 +2254,12 @@ class PhotoDeckV2phSource extends ComicSource {
                                 partialPage = result.page
                                 break
                             }
+                            if (allImages.length && /HTTP 404|Page not found/i.test(result.error)) {
+                                unavailablePage = result.page
+                                tailSkipped = true
+                                break
+                            }
+                            if (canSkipTail()) { tailSkipped = true; break }
                             if (result.rawError) throw result.rawError
                             throw `V2PH Album page error：网页第 ${result.page} 页请求失败，已取得 ${allImages.length}${expectedCount ? "/" + expectedCount : ""} 张；未保存残缺阅读缓存。请检查网络后重新打开。`
                         }
@@ -2305,7 +2311,7 @@ class PhotoDeckV2phSource extends ComicSource {
                     .map((image) => this.imageUrl(image) || String(image ?? ""))
                     .filter((image, index, list) => image && /^https?:\/\//i.test(image) && list.indexOf(image) === index)
                 const reachedLastPage = lastPage > 0 && nextPage > lastPage
-                if (!partialStopped && !expectedCount && !reachedLastPage && !vipLimited) {
+                if (!partialStopped && !tailSkipped && !expectedCount && !reachedLastPage && !vipLimited) {
                     throw `V2PH Album page error：取得 ${finalImages.length} 张，但缺少可靠总数或末页信息，无法确认完整；未保存残缺阅读缓存。`
                 }
                 if (!vipLimited && canSkipTail()) tailSkipped = true
@@ -2358,8 +2364,8 @@ class PhotoDeckV2phSource extends ComicSource {
                     const note = finalImages.length ? `V2PH VIP 限制：已保留 ${finalImages.length}${expectedCount ? "/" + expectedCount : ""} 张公开图片，可直接阅读；其余图片需要相应权限。` : "V2PH VIP 限制：当前账号没有可阅读的公开图片，需要相应 VIP 权限。获得权限后请刷新详情，不必重新导入源。"
                     UI.showMessage(note)
                     detail.description += "\n" + note
-                } else if (!partialStopped && expectedCount > 0 && finalImages.length < expectedCount) {
-                    const note = tailSkipped ? `V2PH 已取得 ${finalImages.length}/${expectedCount} 张，尾部少量图片未取得，已允许阅读。` : `V2PH 已读到明确末页，取得 ${finalImages.length} 张，网站声明 ${expectedCount} 张；数量存在差异，未补造图片。`
+                } else if (unavailablePage || (!partialStopped && expectedCount > 0 && finalImages.length < expectedCount)) {
+                    const note = unavailablePage ? `V2PH 网页第 ${unavailablePage} 页返回 404；已取得 ${finalImages.length}${expectedCount ? "/" + expectedCount : ""} 张，可先阅读，但可能缺页。请对照原站检查，稍后可重新打开。` : tailSkipped ? `V2PH 已取得 ${finalImages.length}/${expectedCount} 张，尾部少量图片未取得，已允许阅读。` : `V2PH 已读到明确末页，取得 ${finalImages.length} 张，识别到的总数为 ${expectedCount} 张；数量存在差异，未补造图片。`
                     UI.showMessage(note)
                     detail.description += "\n" + note
                 }
